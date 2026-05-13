@@ -428,7 +428,7 @@ RejectReason = Literal[
 
 def _is_bot_sender(sender: Any) -> bool:
     # receive_v1 docs say {user, bot}; accept "app" defensively.
-    return getattr(sender, "sender_type", "") in ("bot", "app")
+    return getattr(sender, "sender_type", "") in {"bot", "app"}
 
 
 def _sender_identity(sender: Any) -> frozenset:
@@ -1343,8 +1343,25 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
 
 def check_feishu_requirements() -> bool:
-    """Check if Feishu/Lark dependencies are available."""
-    return FEISHU_AVAILABLE
+    """Check if Feishu/Lark dependencies are available.
+
+    Lazy-installs lark-oapi via ``tools.lazy_deps.ensure("platform.feishu")``
+    on first call if not present.
+    """
+    global FEISHU_AVAILABLE
+    if FEISHU_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("platform.feishu", prompt=False)
+    except Exception:
+        return False
+    try:
+        import lark_oapi  # noqa: F401
+    except ImportError:
+        return False
+    FEISHU_AVAILABLE = True
+    return True
 
 
 class FeishuAdapter(BasePlatformAdapter):
@@ -1428,8 +1445,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
-                    allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
-                    blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    allowlist={str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()},
+                    blacklist={str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()},
                     require_mention=per_chat_require_mention,
                 )
 
@@ -1443,7 +1460,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Env-only so adapter and gateway auth bypass share one source; yaml
         # feishu.allow_bots is bridged to this env var at config load.
         allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
-        if allow_bots not in ("none", "mentions", "all"):
+        if allow_bots not in {"none", "mentions", "all"}:
             logger.warning(
                 "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
                 allow_bots,
@@ -2752,7 +2769,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _reactions_enabled(self) -> bool:
-        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in ("false", "0", "no")
+        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
@@ -3219,7 +3236,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_bot_added_to_chat(data)
         elif event_type == "im.chat.member.bot.deleted_v1":
             self._on_bot_removed_from_chat(data)
-        elif event_type in ("im.message.reaction.created_v1", "im.message.reaction.deleted_v1"):
+        elif event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
         elif event_type == "card.action.trigger":
             self._on_card_action_trigger(data)
@@ -4815,7 +4832,7 @@ def _poll_registration(
 
         # Terminal errors
         error = res.get("error", "")
-        if error in ("access_denied", "expired_token"):
+        if error in {"access_denied", "expired_token"}:
             if poll_count > 0:
                 print()
             logger.warning("[Feishu onboard] Registration %s", error)

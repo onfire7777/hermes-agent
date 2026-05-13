@@ -87,6 +87,11 @@ from agent.usage_pricing import (
     format_duration_compact,
     format_token_count_compact,
 )
+from agent.markdown_tables import (
+    is_table_divider,
+    looks_like_table_row,
+    realign_markdown_tables,
+)
 # NOTE: `from agent.account_usage import ...` is deliberately NOT at module
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
@@ -1349,18 +1354,59 @@ def _preserve_windows_dot_segments_for_markdown(text: str) -> str:
     return _WINDOWS_PATH_WITH_DOT_SEGMENT_RE.sub(_protect, text)
 
 
+def _terminal_width_for_streaming() -> int:
+    """Display cells available inside the streamed response box.
+
+    The streaming path indents every line by ``_STREAM_PAD`` (4 cells)
+    inside an open response panel.  The realigner uses this number as
+    its budget when deciding whether to keep a horizontal table or
+    fall back to vertical key-value rendering.  We subtract a small
+    safety margin so terminal-resize races don't push a borderline
+    table into mid-cell soft-wrap.
+    """
+
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        cols = 80
+    return max(20, cols - len(_STREAM_PAD) - 2)
+
+
 def _render_final_assistant_content(text: str, mode: str = "render"):
     """Render final assistant content as markdown, stripped text, or raw text."""
     from rich.markdown import Markdown
 
+    # Estimate the cells available to the rendered table.  The Panel
+    # used by the background-task / final-response path has 4 cells of
+    # left+right padding plus 1 cell of border on each side, plus the
+    # _STREAM_PAD indent that streamed content uses.  Subtract a small
+    # safety margin so resize races don't push a borderline table into
+    # soft-wrap.
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        cols = 80
+    panel_width = max(20, cols - 12)
+
     normalized_mode = str(mode or "render").strip().lower()
     if normalized_mode == "strip":
-        return _RichText(_strip_markdown_syntax(text))
+        # Strip first — inline markdown inside cells (`code`, **bold**, ~~strike~~)
+        # changes cell display width — then re-align so the column padding
+        # reflects the final visible text, not the marker-decorated source.
+        return _RichText(
+            realign_markdown_tables(_strip_markdown_syntax(text), panel_width)
+        )
     if normalized_mode == "raw":
         return _rich_text_from_ansi(text or "")
 
+    # `render` mode: Rich's Markdown renderer handles CJK width via wcwidth
+    # internally, so a pre-pass through realign_markdown_tables would just
+    # rewrite already-correct padding.  But on the way in we still want to
+    # normalise model-emitted under-padded tables so that mid-render fallbacks
+    # (narrow panels, etc.) at least see consistent input.
     plain = _rich_text_from_ansi(text or "").plain
     plain = _preserve_windows_dot_segments_for_markdown(plain)
+    plain = realign_markdown_tables(plain, panel_width)
     return Markdown(plain)
 
 
@@ -1737,7 +1783,7 @@ def _detect_file_drop(user_input: str) -> "dict | None":
         or stripped.startswith("./")
         or stripped.startswith("../")
         or stripped.startswith("file://")
-        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in ("\\", "/") and stripped[0].isalpha())
+        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in {"\\", "/"} and stripped[0].isalpha())
         or stripped.startswith('"/')
         or stripped.startswith('"~')
         or stripped.startswith("'/")
@@ -1746,7 +1792,7 @@ def _detect_file_drop(user_input: str) -> "dict | None":
         or stripped.startswith('"../')
         or stripped.startswith("'./")
         or stripped.startswith("'../")
-        or (len(stripped) >= 4 and stripped[0] in ("'", '"') and stripped[2] == ":" and stripped[3] in ("\\", "/") and stripped[1].isalpha())
+        or (len(stripped) >= 4 and stripped[0] in {"'", '"'} and stripped[2] == ":" and stripped[3] in {"\\", "/"} and stripped[1].isalpha())
     )
     if not starts_like_path:
         return None
@@ -2344,6 +2390,12 @@ class HermesCLI:
         self._stream_started = False  # True once first delta arrives
         self._stream_box_opened = False  # True once the response box header is printed
         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
+        # Table-row buffer.  When a streamed line looks like it could be
+        # part of a markdown table, hold it here until the block ends so
+        # we can re-pad with wcwidth-aware widths.  Empty by default;
+        # populated only while `_in_stream_table` is True.
+        self._stream_table_buf: list[str] = []
+        self._in_stream_table = False
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
         self._input_mode_recovery_notice_shown = False
@@ -2480,7 +2532,7 @@ class HermesCLI:
         _or_cfg = CLI_CONFIG.get("openrouter", {}) or {}
         _raw_score = _or_cfg.get("min_coding_score")
         self._openrouter_min_coding_score: Optional[float] = None
-        if _raw_score not in (None, ""):
+        if _raw_score not in {None, ""}:
             try:
                 _f = float(_raw_score)
                 if 0.0 <= _f <= 1.0:
@@ -3630,18 +3682,58 @@ class HermesCLI:
             if self.show_timestamps:
                 label = f"{label} {datetime.now().strftime('%H:%M')}"
             w = shutil.get_terminal_size().columns
-            fill = w - 2 - len(label)
+            fill = w - 2 - HermesCLI._status_bar_display_width(label)
             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
 
         self._stream_buf += text
 
         # Emit complete lines, keep partial remainder in buffer
         _tc = getattr(self, "_stream_text_ansi", "")
+
+        def _emit_one(printed_line: str) -> None:
+            _cprint(f"{_STREAM_PAD}{_tc}{printed_line}{_RST}" if _tc else f"{_STREAM_PAD}{printed_line}")
+
+        def _flush_table_buf() -> None:
+            buf = self._stream_table_buf
+            self._stream_table_buf = []
+            self._in_stream_table = False
+            if not buf:
+                return
+            # Strip cell-level markdown (`code`, **bold**, ~~strike~~) FIRST
+            # so the realigner pads to the final visible cell width, not
+            # the marker-decorated source width.  Otherwise a body row
+            # like `` | Bold | `**bold**` | `` lands narrower than its
+            # header column once the markers are removed.
+            joined = "\n".join(buf)
+            if self.final_response_markdown == "strip":
+                joined = _strip_markdown_syntax(joined)
+            block = realign_markdown_tables(joined, _terminal_width_for_streaming())
+            for ln in block.split("\n"):
+                _emit_one(ln)
+
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
+
+            # Hold table-shaped lines in a side-buffer so we can re-pad
+            # the whole block once it ends.  Streaming line-by-line, we
+            # cannot re-align mid-table without reflowing already-printed
+            # rows; the cost is that the user sees the table appear in a
+            # single batch when the block closes instead of row-by-row.
+            if self._in_stream_table:
+                if looks_like_table_row(line) or is_table_divider(line):
+                    self._stream_table_buf.append(line)
+                    continue
+                # Block ended — flush the realigned table, then fall
+                # through to print the current (non-table) line.
+                _flush_table_buf()
+            elif looks_like_table_row(line):
+                self._stream_table_buf.append(line)
+                self._in_stream_table = True
+                continue
+
             if self.final_response_markdown == "strip":
                 line = _strip_markdown_syntax(line)
-            _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
+            _emit_one(line)
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -3656,8 +3748,34 @@ class HermesCLI:
         # Close reasoning box if still open (in case no content tokens arrived)
         self._close_reasoning_box()
 
+        _tc = getattr(self, "_stream_text_ansi", "")
+
+        # If the stream buffer has a trailing partial line that looks like
+        # a table row, fold it into the table buffer so the whole block
+        # gets re-aligned together.  Otherwise the final row prints raw
+        # (with the model's original under-padded spacing) while the rows
+        # above it are aligned.
+        if (
+            self._stream_buf
+            and getattr(self, "_in_stream_table", False)
+            and (looks_like_table_row(self._stream_buf) or is_table_divider(self._stream_buf))
+        ):
+            self._stream_table_buf.append(self._stream_buf)
+            self._stream_buf = ""
+
+        # Flush any buffered table rows first so their padding is
+        # finalised before the stream remainder lands.
+        if getattr(self, "_stream_table_buf", None):
+            joined = "\n".join(self._stream_table_buf)
+            self._stream_table_buf = []
+            self._in_stream_table = False
+            if self.final_response_markdown == "strip":
+                joined = _strip_markdown_syntax(joined)
+            block = realign_markdown_tables(joined, _terminal_width_for_streaming())
+            for ln in block.split("\n"):
+                _cprint(f"{_STREAM_PAD}{_tc}{ln}{_RST}" if _tc else f"{_STREAM_PAD}{ln}")
+
         if self._stream_buf:
-            _tc = getattr(self, "_stream_text_ansi", "")
             line = _strip_markdown_syntax(self._stream_buf) if self.final_response_markdown == "strip" else self._stream_buf
             _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
@@ -3680,6 +3798,8 @@ class HermesCLI:
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
         self._deferred_content = ""
+        self._stream_table_buf = []
+        self._in_stream_table = False
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -4110,12 +4230,34 @@ class HermesCLI:
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
             return False
     
+    def _show_security_advisories(self):
+        """Show a startup banner if any unacked security advisories match.
+
+        Renders a single bold-red box on stderr (so piped stdout remains
+        clean) listing the worst hit and pointing at ``hermes doctor``.
+        Banner-cache rate-limits this to once per 24h per advisory; full
+        remediation lives behind ``hermes doctor`` so the banner stays
+        small.
+        """
+        try:
+            from hermes_cli.security_advisories import (
+                detect_compromised,
+                startup_banner,
+            )
+            hits = detect_compromised()
+            banner = startup_banner(hits)
+            if banner:
+                # Print to stderr — keeps stdout clean for piped automation,
+                # and Rich's banner rendering already wrote to stdout above.
+                print(banner, file=sys.stderr, flush=True)
+        except Exception:
+            # Never let the security banner block startup. Failures are
+            # logged at DEBUG by the advisory module.
+            pass
+
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
-
-        # Get context length for display before branching so it remains
-        # available to the low-context warning logic in compact mode too.
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
             ctx_len = self.agent.context_compressor.context_length
@@ -4591,7 +4733,7 @@ class HermesCLI:
         parts = command.split()
         subcmd = parts[1].lower() if len(parts) > 1 else "list"
 
-        if subcmd in ("list", "ls"):
+        if subcmd in {"list", "ls"}:
             snaps = list_quick_snapshots()
             if not snaps:
                 print("  No state snapshots yet.")
@@ -4619,7 +4761,7 @@ class HermesCLI:
             else:
                 print("  No state files found to snapshot.")
 
-        elif subcmd in ("restore", "rewind"):
+        elif subcmd in {"restore", "rewind"}:
             if len(parts) < 3:
                 print("  Usage: /snapshot restore <snapshot-id>")
                 # Show hint with most recent snapshot
@@ -5158,7 +5300,7 @@ class HermesCLI:
             parts = cmd.split()
 
         subcommand = parts[1] if len(parts) > 1 else ""
-        if subcommand not in ("list", "disable", "enable"):
+        if subcommand not in {"list", "disable", "enable"}:
             self.show_tools()
             return
 
@@ -6742,7 +6884,7 @@ class HermesCLI:
             # Set personality
             personality_name = parts[1].strip().lower()
             
-            if personality_name in ("none", "default", "neutral"):
+            if personality_name in {"none", "default", "neutral"}:
                 self.system_prompt = ""
                 self.agent = None  # Force re-init
                 if save_config_value("agent.system_prompt", ""):
@@ -7150,7 +7292,7 @@ class HermesCLI:
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
         
-        if canonical in ("quit", "exit"):
+        if canonical in {"quit", "exit"}:
             return False
         elif canonical == "help":
             self.show_help()
@@ -7280,20 +7422,19 @@ class HermesCLI:
                         _cprint(f"  {format_session_db_unavailable()}")
                 else:
                     _cprint("  Usage: /title <your session title>")
-            else:
-                # Show current title and session ID if no argument given
-                if self._session_db:
-                    _cprint(f"  Session ID: {self.session_id}")
-                    session = self._session_db.get_session(self.session_id)
-                    if session and session.get("title"):
-                        _cprint(f"  Title: {session['title']}")
-                    elif self._pending_title:
-                        _cprint(f"  Title (pending): {self._pending_title}")
-                    else:
-                        _cprint("  No title set. Usage: /title <your session title>")
+            # Show current title and session ID if no argument given
+            elif self._session_db:
+                _cprint(f"  Session ID: {self.session_id}")
+                session = self._session_db.get_session(self.session_id)
+                if session and session.get("title"):
+                    _cprint(f"  Title: {session['title']}")
+                elif self._pending_title:
+                    _cprint(f"  Title (pending): {self._pending_title}")
                 else:
-                    from hermes_state import format_session_db_unavailable
-                    _cprint(f"  {format_session_db_unavailable()}")
+                    _cprint("  No title set. Usage: /title <your session title>")
+            else:
+                from hermes_state import format_session_db_unavailable
+                _cprint(f"  {format_session_db_unavailable()}")
         elif canonical == "handoff":
             if not self._handle_handoff_command(cmd_original):
                 return False
@@ -7475,6 +7616,8 @@ class HermesCLI:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            # shell=True is intentional: quick_commands are user-defined
+                            # shell snippets from config.yaml — not agent/LLM controlled.
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
                                 text=True, timeout=30
@@ -8025,7 +8168,7 @@ class HermesCLI:
                 )
             return
 
-        if lower in ("clear", "stop", "done"):
+        if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
             mgr.clear()
             if had:
@@ -8115,7 +8258,7 @@ class HermesCLI:
                         parts = [
                             p.get("text", "")
                             for p in content
-                            if isinstance(p, dict) and p.get("type") in ("text", "output_text")
+                            if isinstance(p, dict) and p.get("type") in {"text", "output_text"}
                         ]
                         last_response = "\n".join(t for t in parts if t)
                     else:
@@ -8210,7 +8353,7 @@ class HermesCLI:
         current = bool(footer_cfg.get("enabled", False))
         fields = footer_cfg.get("fields") or ["model", "context_pct", "cwd"]
 
-        if arg in ("status", "?"):
+        if arg in {"status", "?"}:
             state = "ON" if current else "OFF"
             _cprint(
                 f"  {_Colors.BOLD}Runtime footer:{_Colors.RESET} {state}\n"
@@ -8218,9 +8361,9 @@ class HermesCLI:
             )
             return
 
-        if arg in ("on", "enable", "true", "1"):
+        if arg in {"on", "enable", "true", "1"}:
             new_state = True
-        elif arg in ("off", "disable", "false", "0"):
+        elif arg in {"off", "disable", "false", "0"}:
             new_state = False
         elif arg == "":
             new_state = not current
@@ -8313,7 +8456,7 @@ class HermesCLI:
         arg = parts[1].strip().lower()
 
         # Display toggle
-        if arg in ("show", "on"):
+        if arg in {"show", "on"}:
             self.show_reasoning = True
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
@@ -8321,7 +8464,7 @@ class HermesCLI:
             _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
             _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
             return
-        if arg in ("hide", "off"):
+        if arg in {"hide", "off"}:
             self.show_reasoning = False
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
@@ -8680,6 +8823,9 @@ class HermesCLI:
             elif parts[i] == "--source" and i + 1 < len(parts):
                 source = parts[i + 1]
                 i += 2
+            elif parts[i].isdigit():
+                days = int(parts[i])
+                i += 1
             else:
                 i += 1
 
@@ -9083,7 +9229,7 @@ class HermesCLI:
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
             # Print stacked scrollback line for "all" / "new" modes
-            if function_name and self.tool_progress_mode in ("all", "new"):
+            if function_name and self.tool_progress_mode in {"all", "new"}:
                 duration = kwargs.get("duration", 0.0)
                 is_error = kwargs.get("is_error", False)
                 # Pop stored args from tool.started for this function
@@ -10265,7 +10411,7 @@ class HermesCLI:
                         label = " ⚕ Hermes "
                         if self.show_timestamps:
                             label = f"{label}{datetime.now().strftime('%H:%M')} "
-                        fill = w - 2 - len(label)
+                        fill = w - 2 - HermesCLI._status_bar_display_width(label)
                         _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
                     _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
 
@@ -10735,7 +10881,7 @@ class HermesCLI:
         try:
             from hermes_cli.profiles import get_active_profile_name
             profile = get_active_profile_name()
-            if profile not in ("default", "custom"):
+            if profile not in {"default", "custom"}:
                 symbol = f"{profile} {symbol}"
         except Exception:
             pass
@@ -10913,10 +11059,9 @@ class HermesCLI:
             pass
 
         self.show_banner()
-
-        # One-line Honcho session indicator (TTY-only, not captured by agent).
-        # Only show when the user explicitly configured Honcho for Hermes
-        # (not auto-enabled from a stray HONCHO_API_KEY env var).
+        # Surface any active supply-chain security advisories right after the
+        # welcome banner. Quiet/single-query paths call this themselves.
+        self._show_security_advisories()
         # If resuming a session, load history and display it immediately
         # so the user has context before typing their first message.
         if self._resumed:
@@ -10939,7 +11084,7 @@ class HermesCLI:
         # see that they're running without the safety net.
         try:
             _redact_raw = os.getenv("HERMES_REDACT_SECRETS", "true")
-            if _redact_raw.lower() not in ("1", "true", "yes", "on"):
+            if _redact_raw.lower() not in {"1", "true", "yes", "on"}:
                 self._console_print(
                     "[bold red]⚠  Secret redaction is DISABLED[/] "
                     f"(HERMES_REDACT_SECRETS={_redact_raw}). "
@@ -11602,16 +11747,15 @@ class HermesCLI:
                 self._last_ctrl_c_time = now
                 print("\n⚡ Interrupting agent... (press Ctrl+C again to force exit)")
                 self.agent.interrupt()
+            # If there's text or images, clear them (like bash).
+            # If everything is already empty, exit.
+            elif event.app.current_buffer.text or self._attached_images:
+                event.app.current_buffer.reset()
+                self._attached_images.clear()
+                event.app.invalidate()
             else:
-                # If there's text or images, clear them (like bash).
-                # If everything is already empty, exit.
-                if event.app.current_buffer.text or self._attached_images:
-                    event.app.current_buffer.reset()
-                    self._attached_images.clear()
-                    event.app.invalidate()
-                else:
-                    self._should_exit = True
-                    event.app.exit()
+                self._should_exit = True
+                event.app.exit()
 
         # Ctrl+Shift+C: no binding needed. Terminal emulators (GNOME Terminal,
         # iTerm2, kitty, Windows Terminal, etc.) intercept Ctrl+Shift+C before
@@ -11696,14 +11840,13 @@ class HermesCLI:
             if self._agent_running and self.agent:
                 print("\n⚡ Interrupting agent...")
                 self.agent.interrupt()
+            elif event.app.current_buffer.text or self._attached_images:
+                event.app.current_buffer.reset()
+                self._attached_images.clear()
+                event.app.invalidate()
             else:
-                if event.app.current_buffer.text or self._attached_images:
-                    event.app.current_buffer.reset()
-                    self._attached_images.clear()
-                    event.app.invalidate()
-                else:
-                    self._should_exit = True
-                    event.app.exit()
+                self._should_exit = True
+                event.app.exit()
 
         @kb.add('c-d')
         def handle_ctrl_d(event):
@@ -13428,6 +13571,9 @@ def main(
             _query_label = query or ("[image attached]" if single_query_images else "")
             if _query_label:
                 cli.console.print(f"[bold blue]Query:[/] {_query_label}")
+            # Surface security advisories before the agent runs — short
+            # banner, doesn't depend on the welcome banner being shown.
+            cli._show_security_advisories()
             cli.chat(query, images=single_query_images or None)
             cli._print_exit_summary()
         return
