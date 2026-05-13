@@ -80,6 +80,11 @@ class TestAvailability:
         monkeypatch.setenv("OPENAI_API_KEY", "test")
         assert openai_plugin.OpenAIImageGenProvider().is_available() is True
 
+    def test_api_key_from_hermes_env_available(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        (tmp_path / ".env").write_text("OPENAI_API_KEY=test-from-env-file\n", encoding="utf-8")
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is True
+
 
 # ── Model resolution ────────────────────────────────────────────────────────
 
@@ -144,6 +149,8 @@ class TestGenerate:
 
         with _patched_openai(fake_client):
             result = provider.generate("a cat", aspect_ratio="landscape")
+            fake_openai_module = __import__("openai")
+            assert fake_openai_module.OpenAI.call_args.kwargs["api_key"] == "test-key"
 
         assert result["success"] is True
         assert result["model"] == "gpt-image-2-medium"
@@ -161,8 +168,10 @@ class TestGenerate:
         assert call_kwargs["model"] == "gpt-image-2"
         assert call_kwargs["quality"] == "medium"
         assert call_kwargs["size"] == "1536x1024"
+
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
+
 
     @pytest.mark.parametrize("tier,expected_quality", [
         ("gpt-image-2-low", "low"),

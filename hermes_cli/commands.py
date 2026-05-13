@@ -866,28 +866,21 @@ def discord_skill_commands_by_category(
             # Clamp to 32 chars (Discord per-command name limit)
             discord_name = raw_name[:32]
             if discord_name in _names_used:
-                # Two skills whose first 32 chars are identical. One wins
-                # (the first one seen, which is alphabetical because the
-                # caller iterates ``sorted(skill_cmds)``); the other is
-                # dropped from Discord's /skill autocomplete.
-                #
-                # Silently counting this as ``hidden`` (the old behavior)
-                # meant skill authors had no way to discover the drop —
-                # their skill just didn't appear in the picker. Emit a
-                # WARNING naming both sides so the author can rename the
-                # losing skill's frontmatter name to something with a
-                # distinct 32-char prefix.
                 prior = _names_used[discord_name]
                 if prior == "<reserved>":
-                    logger.warning(
-                        "Discord /skill: %r (from %r) collides on its 32-char "
-                        "clamp with a reserved gateway command name %r — the "
-                        "skill will not appear in the /skill autocomplete. "
-                        "Rename the skill's frontmatter ``name:`` to differ "
-                        "in its first 32 chars.",
-                        discord_name, cmd_key, discord_name,
-                    )
+                    alias_base = f"skill-{raw_name}"[:32]
+                    alias = alias_base
+                    suffix_num = 2
+                    while alias in _names_used:
+                        suffix = f"-{suffix_num}"
+                        alias = f"{alias_base[:32 - len(suffix)]}{suffix}"
+                        suffix_num += 1
+                    discord_name = alias
                 else:
+                    # Two skills whose first 32 chars are identical. One wins
+                    # (the first one seen, which is alphabetical because the
+                    # caller iterates ``sorted(skill_cmds)``); the other is
+                    # dropped from Discord's /skill autocomplete.
                     logger.warning(
                         "Discord /skill: %r and %r both clamp to %r on "
                         "Discord's 32-char command-name limit — only %r "
@@ -896,8 +889,8 @@ def discord_skill_commands_by_category(
                         "its first 32 chars.",
                         prior, cmd_key, discord_name, prior,
                     )
-                hidden += 1
-                continue
+                    hidden += 1
+                    continue
             _names_used[discord_name] = cmd_key
 
             desc = info.get("description", "")

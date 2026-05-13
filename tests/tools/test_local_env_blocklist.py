@@ -16,6 +16,8 @@ from tools.environments.local import (
     LocalEnvironment,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+    _HERMES_RUNTIME_ENV_BLOCKLIST,
+    _sanitize_subprocess_env,
 )
 
 
@@ -187,8 +189,42 @@ class TestForceEnvOptIn:
         assert result_env["OPENAI_BASE_URL"] == "http://intended/v1"
 
 
+class TestRuntimeEnvBlocklist:
+    """Hermes host runtime vars must not poison user shell commands."""
+
+    def test_pythonhome_is_stripped_from_foreground_env(self):
+        """PYTHONHOME inherited from a uv-managed Hermes process must not leak."""
+        result_env = _run_with_env(extra_os_env={
+            "PYTHONHOME": r"C:\Users\burni\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none",
+        })
+
+        assert "PYTHONHOME" not in result_env
+
+    def test_pythonhome_in_self_env_is_stripped(self):
+        result_env = _run_with_env(self_env={"PYTHONHOME": "/opt/hermes-python"})
+
+        assert "PYTHONHOME" not in result_env
+
+    def test_force_prefix_can_explicitly_pass_pythonhome(self):
+        result_env = _run_with_env(
+            extra_os_env={"PYTHONHOME": "/bad/inherited/python"},
+            self_env={f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}PYTHONHOME": "/intended/python"},
+        )
+
+        assert result_env["PYTHONHOME"] == "/intended/python"
+
+    def test_pythonhome_is_stripped_from_background_env(self):
+        result_env = _sanitize_subprocess_env(
+            {"PATH": "/usr/bin:/bin", "PYTHONHOME": "/bad/inherited/python"},
+            {},
+        )
+
+        assert "PYTHONHOME" not in result_env
+
+
 class TestBlocklistCoverage:
     """Sanity checks that the blocklist covers all known providers."""
+
 
     def test_issue_1002_offenders(self):
         """Blocklist includes the main offenders from issue #1002."""
@@ -222,6 +258,9 @@ class TestBlocklistCoverage:
         must also be in the blocklist."""
         extras = {"ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
         assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
+
+    def test_runtime_env_blocklist_covers_pythonhome(self):
+        assert "PYTHONHOME" in _HERMES_RUNTIME_ENV_BLOCKLIST
 
     def test_non_registry_provider_vars_are_in_blocklist(self):
         extras = {
@@ -315,7 +354,8 @@ class TestSanePathIncludesHomebrew:
         _SANE_PATH which now includes Homebrew dirs."""
         from tools.environments.local import _make_run_env
         minimal_env = {"PATH": "/some/custom/bin"}
-        with patch.dict(os.environ, minimal_env, clear=True):
+        with patch("tools.environments.local._IS_WINDOWS", False), \
+             patch.dict(os.environ, minimal_env, clear=True):
             result = _make_run_env({})
         assert "/opt/homebrew/bin" in result["PATH"]
         assert "/opt/homebrew/sbin" in result["PATH"]

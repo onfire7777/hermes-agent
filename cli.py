@@ -1463,10 +1463,20 @@ def _cprint(text: str):
     """
     _record_output_history(text)
 
+    def _pt_print_or_plain(value: str) -> None:
+        """Print through prompt_toolkit, falling back in headless Windows pipes."""
+        try:
+            _pt_print(_PT_ANSI(value))
+        except Exception:
+            try:
+                print(value)
+            except Exception:
+                pass
+
     try:
         from prompt_toolkit.application import get_app_or_none, run_in_terminal
     except Exception:
-        _pt_print(_PT_ANSI(text))
+        _pt_print_or_plain(text)
         return
 
     app = None
@@ -1479,7 +1489,7 @@ def _cprint(text: str):
     # direct prompt_toolkit print is safe and matches existing behavior
     # (spinner frames, streamed tokens, tool activity prefixes, …).
     if app is None or not getattr(app, "_is_running", False):
-        _pt_print(_PT_ANSI(text))
+        _pt_print_or_plain(text)
         return
 
     try:
@@ -1487,7 +1497,7 @@ def _cprint(text: str):
     except Exception:
         loop = None
     if loop is None:
-        _pt_print(_PT_ANSI(text))
+        _pt_print_or_plain(text)
         return
 
     import asyncio as _asyncio
@@ -1503,7 +1513,7 @@ def _cprint(text: str):
         current_loop = None
     # Same thread as the app's loop → safe to print directly.
     if current_loop is loop and loop.is_running():
-        _pt_print(_PT_ANSI(text))
+        _pt_print_or_plain(text)
         return
 
     # Cross-thread emission: ask the app's event loop to schedule a
@@ -1512,10 +1522,10 @@ def _cprint(text: str):
     # fails we fall back to a direct print so the line isn't lost.
     def _schedule():
         try:
-            run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+            run_in_terminal(lambda: _pt_print_or_plain(text))
         except Exception:
             try:
-                _pt_print(_PT_ANSI(text))
+                _pt_print_or_plain(text)
             except Exception:
                 pass
 
@@ -1523,7 +1533,7 @@ def _cprint(text: str):
         loop.call_soon_threadsafe(_schedule)
     except Exception:
         try:
-            _pt_print(_PT_ANSI(text))
+            _pt_print_or_plain(text)
         except Exception:
             pass
 
@@ -2246,6 +2256,7 @@ class HermesCLI:
         base_url: str = None,
         max_turns: int = None,
         verbose: bool = False,
+        quiet: bool = False,
         compact: bool = False,
         resume: str = None,
         checkpoints: bool = False,
@@ -2263,6 +2274,7 @@ class HermesCLI:
             base_url: API base URL (default: OpenRouter)
             max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
             verbose: Enable verbose logging
+            quiet: Suppress non-response status output in single-query automation mode
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
@@ -2296,6 +2308,7 @@ class HermesCLI:
         else:
             self.busy_input_mode = "interrupt"
 
+        self.quiet = bool(quiet)
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
@@ -3967,11 +3980,12 @@ class HermesCLI:
             except Exception:
                 resolved_id = self.session_id
             if resolved_id and resolved_id != self.session_id:
-                ChatConsole().print(
-                    f"[{_DIM}]Session {_escape(self.session_id)} was compressed into "
-                    f"{_escape(resolved_id)}; resuming the descendant with your "
-                    f"transcript.[/]"
-                )
+                if not self.quiet:
+                    ChatConsole().print(
+                        f"[{_DIM}]Session {_escape(self.session_id)} was compressed into "
+                        f"{_escape(resolved_id)}; resuming the descendant with your "
+                        f"transcript.[/]"
+                    )
                 self.session_id = resolved_id
                 resolved_meta = self._session_db.get_session(self.session_id)
                 if resolved_meta:
@@ -3984,16 +3998,18 @@ class HermesCLI:
                 title_part = ""
                 if session_meta.get("title"):
                     title_part = f" \"{session_meta['title']}\""
-                ChatConsole().print(
-                    f"[bold {_accent_hex()}]↻ Resumed session[/] "
-                    f"[bold]{_escape(self.session_id)}[/]"
-                    f"[bold {_accent_hex()}]{_escape(title_part)}[/] "
-                    f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(restored)} total messages)"
-                )
+                if not self.quiet:
+                    ChatConsole().print(
+                        f"[bold {_accent_hex()}]↻ Resumed session[/] "
+                        f"[bold]{_escape(self.session_id)}[/]"
+                        f"[bold {_accent_hex()}]{_escape(title_part)}[/] "
+                        f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(restored)} total messages)"
+                    )
             else:
-                ChatConsole().print(
-                    f"[bold {_accent_hex()}]Session {_escape(self.session_id)} found but has no messages. Starting fresh.[/]"
-                )
+                if not self.quiet:
+                    ChatConsole().print(
+                        f"[bold {_accent_hex()}]Session {_escape(self.session_id)} found but has no messages. Starting fresh.[/]"
+                    )
             # Re-open the session (clear ended_at so it's active again)
             try:
                 self._session_db._conn.execute(
@@ -13245,6 +13261,7 @@ def main(
         base_url=base_url,
         max_turns=max_turns,
         verbose=verbose,
+        quiet=quiet,
         compact=compact,
         resume=resume,
         checkpoints=checkpoints,

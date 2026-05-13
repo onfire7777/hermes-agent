@@ -18,6 +18,26 @@ _IS_WINDOWS = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
+def _windows_native_path_for_shell_cwd(path: str) -> str:
+    """Convert Git Bash/WSL drive paths to native Windows paths for Popen."""
+    if not (_IS_WINDOWS and path):
+        return path
+
+    git_bash_match = re.match(r"^/([a-zA-Z])(?:/|$)(.*)", path)
+    if git_bash_match:
+        drive = git_bash_match.group(1).upper()
+        rest = git_bash_match.group(2).replace("/", "\\")
+        return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+
+    wsl_match = re.match(r"^/mnt/([a-zA-Z])(?:/|$)(.*)", path)
+    if wsl_match:
+        drive = wsl_match.group(1).upper()
+        rest = wsl_match.group(2).replace("/", "\\")
+        return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+
+    return path
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
     ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
@@ -30,9 +50,10 @@ def _resolve_safe_cwd(cwd: str) -> str:
     raises ``FileNotFoundError`` before bash starts, wedging every subsequent
     terminal call until the gateway restarts.
     """
-    if cwd and os.path.isdir(cwd):
+    native_cwd = _windows_native_path_for_shell_cwd(cwd)
+    if cwd and os.path.isdir(native_cwd):
         return cwd
-    parent = os.path.dirname(cwd) if cwd else ""
+    parent = os.path.dirname(native_cwd) if cwd else ""
     while parent:
         if os.path.isdir(parent):
             return parent
@@ -47,6 +68,15 @@ def _resolve_safe_cwd(cwd: str) -> str:
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
 _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
+
+# Python runtime-control vars inherited from the Hermes host process can poison
+# user shell commands. On Windows in particular, a uv-managed gateway may run
+# with PYTHONHOME pointing at its own 3.11 runtime while `python` on PATH points
+# at 3.14; passing that mismatch into Git Bash makes `python -c 'import re'`
+# crash with "SRE module mismatch". Terminal commands should see the user's
+# normal shell Python unless the user explicitly opts in via env_passthrough or
+# _HERMES_FORCE_PYTHONHOME.
+_HERMES_RUNTIME_ENV_BLOCKLIST = frozenset({"PYTHONHOME"})
 
 
 def _build_provider_env_blocklist() -> frozenset:
@@ -156,6 +186,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
+        if key in _HERMES_RUNTIME_ENV_BLOCKLIST and not _is_passthrough(key):
+            continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
@@ -163,6 +195,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             sanitized[real_key] = value
+        elif key in _HERMES_RUNTIME_ENV_BLOCKLIST and not _is_passthrough(key):
+            continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
@@ -209,10 +243,6 @@ def _find_bash() -> str:
             if os.path.isfile(candidate):
                 return candidate
 
-    found = shutil.which("bash")
-    if found:
-        return found
-
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
@@ -220,6 +250,10 @@ def _find_bash() -> str:
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
+
+    found = shutil.which("bash")
+    if found:
+        return found
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
@@ -252,19 +286,23 @@ def _make_run_env(env: dict) -> dict:
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             run_env[real_key] = v
+        elif k in _HERMES_RUNTIME_ENV_BLOCKLIST and not _is_passthrough(k):
+            continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
+
     existing_path = run_env.get("PATH", "")
     # The "/usr/bin not already present → inject sane POSIX path" heuristic
-    # only makes sense on POSIX.  On Windows the PATH separator is ";"
+    # only makes sense on POSIX. On Windows the PATH separator is ";"
     # (the split(":") above turns a full Windows PATH into a single
     # unrecognisable chunk, which then triggers prepending POSIX paths
-    # to a Windows PATH — completely wrong).  Skip the injection entirely
+    # to a Windows PATH — completely wrong). Skip the injection entirely
     # on Windows; the native PATH already points at whatever shell
     # Hermes is driving via _find_bash (Git Bash), and Git Bash itself
     # prepends its MSYS2 /usr/bin equivalent via the shell-init files.
     if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
@@ -455,23 +493,27 @@ class LocalEnvironment(BaseEnvironment):
             self.cwd = safe_cwd
 
         # On Windows, self.cwd may be a Git Bash-style path (/c/Users/...)
-        # from pwd output. subprocess.Popen needs a native Windows path.
-        _popen_cwd = self.cwd
-        if _IS_WINDOWS and _popen_cwd and re.match(r'^/[a-zA-Z]/', _popen_cwd):
-            _popen_cwd = _popen_cwd[1].upper() + ':' + _popen_cwd[2:].replace('/', '\\')
+        # or a WSL-style path (/mnt/c/Users/...) from pwd output. Native
+        # subprocess.Popen needs a Windows path even when the child is bash.
+        _popen_cwd = _windows_native_path_for_shell_cwd(self.cwd)
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=_popen_cwd,
-        )
+        popen_kwargs = {
+            "text": True,
+            "env": run_env,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            "preexec_fn": None if _IS_WINDOWS else os.setsid,
+            "cwd": _popen_cwd,
+        }
+        if _IS_WINDOWS:
+            # Suppress transient Git Bash / cmd windows when Hermes runs tool
+            # commands from the desktop app or gateway.
+            popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(args, **popen_kwargs)
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)

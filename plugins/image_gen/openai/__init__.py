@@ -92,6 +92,25 @@ def _load_openai_config() -> Dict[str, Any]:
         return {}
 
 
+def _resolve_openai_api_key() -> str:
+    """Return OPENAI_API_KEY from process env or Hermes .env.
+
+    Gateway sessions often start before a newly-added key is exported into the
+    process environment, while Hermes stores user-supplied keys in
+    ``$HERMES_HOME/.env``. Mirror the FAL helper behavior so image-gen provider
+    availability matches the CLI setup UI.
+    """
+    value = os.environ.get("OPENAI_API_KEY")
+    if value is None:
+        try:
+            from hermes_cli.config import get_env_value
+
+            value = get_env_value("OPENAI_API_KEY")
+        except Exception:
+            value = None
+    return (value or "").strip()
+
+
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
@@ -133,7 +152,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
-        if not os.environ.get("OPENAI_API_KEY"):
+        if not _resolve_openai_api_key():
             return False
         try:
             import openai  # noqa: F401
@@ -187,7 +206,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        if not os.environ.get("OPENAI_API_KEY"):
+        api_key = _resolve_openai_api_key()
+        if not api_key:
             return error_response(
                 error=(
                     "OPENAI_API_KEY not set. Run `hermes tools` → Image "
@@ -223,7 +243,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         }
 
         try:
-            client = openai.OpenAI()
+            client = openai.OpenAI(api_key=api_key)
             response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)

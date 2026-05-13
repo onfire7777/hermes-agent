@@ -6486,11 +6486,15 @@ class GatewayRunner:
                             # has all API keys in os.environ.
                             from tools.environments.local import _sanitize_subprocess_env
                             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            subprocess_kwargs = {}
+                            if os.name == "nt":
+                                subprocess_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                                 env=sanitized_env,
+                                **subprocess_kwargs,
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
@@ -16456,11 +16460,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
+    cron_interval = 60
+    try:
+        _cron_cfg = (_load_gateway_config().get("cron") or {})
+        _raw_interval = os.getenv("HERMES_CRON_TICK_INTERVAL") or _cron_cfg.get("tick_interval_seconds")
+        if _raw_interval is not None:
+            cron_interval = max(60, int(_raw_interval))
+    except Exception as exc:
+        logger.debug("Invalid cron tick interval config; using default 60s: %s", exc)
     cron_stop = threading.Event()
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "interval": cron_interval},
         daemon=True,
         name="cron-ticker",
     )

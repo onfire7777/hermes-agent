@@ -577,17 +577,28 @@ class DiscordAdapter(BasePlatformAdapter):
             import ctypes.util
             opus_path = ctypes.util.find_library("opus")
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
-            # so fall back to known Homebrew paths if needed.
+            # and on Windows when users install a private DLL outside PATH.
+            # Fall back to explicit env/config-adjacent locations before warning.
             if not opus_path:
-                _homebrew_paths = (
-                    "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
-                    "/usr/local/lib/libopus.dylib",     # Intel Mac
-                )
+                opus_candidates = []
+                env_opus = os.getenv("DISCORD_OPUS_LIBRARY_PATH", "").strip()
+                if env_opus:
+                    opus_candidates.append(env_opus)
                 if sys.platform == "darwin":
-                    for _hp in _homebrew_paths:
-                        if os.path.isfile(_hp):
-                            opus_path = _hp
-                            break
+                    opus_candidates.extend((
+                        "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
+                        "/usr/local/lib/libopus.dylib",     # Intel Mac
+                    ))
+                elif sys.platform == "win32":
+                    hermes_home = _Path(os.getenv("HERMES_HOME", str(_Path.home() / ".hermes")))
+                    opus_candidates.extend((
+                        str(hermes_home / "deps" / "opus" / "Library" / "bin" / "opus.dll"),
+                        str(hermes_home / "deps" / "opus" / "Library" / "bin" / "libopus-0.dll"),
+                    ))
+                for candidate in opus_candidates:
+                    if os.path.isfile(candidate):
+                        opus_path = candidate
+                        break
             if opus_path:
                 try:
                     discord.opus.load_opus(opus_path)

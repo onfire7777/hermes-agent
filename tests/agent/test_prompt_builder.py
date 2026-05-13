@@ -265,6 +265,10 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+        assert "Skills (router-first)" in result
+        assert "skill-router skill <name>" in result
+        assert "Do not call `skill_view` for a skill selected by `skill-router`" in result
+        assert "MUST load it with skill_view" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
