@@ -267,7 +267,7 @@ def _build_startup_launcher(script_path: Path) -> str:
     """
     argv, working_dir, env_overlay = _build_gateway_argv()
     command = " ".join(_quote_windows_command_arg(arg) for arg in argv)
-    check_interval_ms = 600000
+    check_interval_ms = 300000
     lines = [
         "Option Explicit",
         "",
