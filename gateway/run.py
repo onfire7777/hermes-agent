@@ -417,6 +417,15 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
 
 
+def _resolved_gateway_max_iterations() -> int:
+    """Return the authoritative per-turn agent budget for gateway-created agents."""
+    _reload_runtime_env_preserving_config_authority()
+    try:
+        return int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+    except (TypeError, ValueError):
+        return 90
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -10267,7 +10276,7 @@ class GatewayRunner:
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            max_iterations = _resolved_gateway_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -14709,9 +14718,6 @@ class GatewayRunner:
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
-            # Read from env var or use default (same as CLI)
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
@@ -14728,7 +14734,7 @@ class GatewayRunner:
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
-            _reload_runtime_env_preserving_config_authority()
+            max_iterations = _resolved_gateway_max_iterations()
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -14870,7 +14876,10 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys={
+                    **self._extract_cache_busting_config(user_config),
+                    "max_iterations": max_iterations,
+                },
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)

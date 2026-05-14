@@ -37,6 +37,44 @@ def test_reload_runtime_env_preserves_config_max_turns(tmp_path: Path, monkeypat
     assert os.environ["HERMES_MAX_ITERATIONS"] == "9000"
 
 
+def test_resolved_gateway_max_iterations_prefers_config_over_stale_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"max_turns": 100}}),
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text("HERMES_MAX_ITERATIONS=30\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "30")
+
+    assert gateway_run._resolved_gateway_max_iterations() == 100
+    assert os.environ["HERMES_MAX_ITERATIONS"] == "100"
+
+
+def test_agent_cache_signature_changes_when_budget_changes() -> None:
+    base_kwargs = {
+        "model": "gpt-test",
+        "runtime": {"provider": "test", "base_url": "http://127.0.0.1", "api_mode": "chat_completions"},
+        "enabled_toolsets": ["hermes-cli"],
+        "ephemeral_prompt": "",
+    }
+
+    sig_30 = gateway_run.GatewayRunner._agent_config_signature(
+        **base_kwargs,
+        cache_keys={"max_iterations": 30},
+    )
+    sig_100 = gateway_run.GatewayRunner._agent_config_signature(
+        **base_kwargs,
+        cache_keys={"max_iterations": 100},
+    )
+
+    assert sig_30 != sig_100
+
+
 def test_reload_runtime_env_keeps_env_max_iterations_when_config_omits_key(
     tmp_path: Path, monkeypatch
 ) -> None:
