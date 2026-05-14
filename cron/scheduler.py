@@ -750,6 +750,23 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     script_timeout = _get_script_timeout()
 
+    def _script_path_for_bash(script: Path, bash_exe: str) -> str:
+        """Return a Bash-readable path for Windows-hosted scripts."""
+        if os.name != "nt":
+            return str(script)
+        resolved = script.resolve()
+        drive = resolved.drive.rstrip(":").lower()
+        if not drive:
+            return str(resolved).replace("\\", "/")
+        tail = resolved.relative_to(resolved.anchor).as_posix()
+        bash_norm = bash_exe.replace("\\", "/").lower()
+        prefix = f"/mnt/{drive}" if bash_norm.endswith("/windows/system32/bash.exe") else f"/{drive}"
+        return f"{prefix}/{tail}"
+
+    def _quote_bash_literal(value: str) -> str:
+        """Single-quote a string for a Bash -c command."""
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
@@ -770,7 +787,13 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
-        argv = [_bash, str(path)]
+        bash_cwd = _script_path_for_bash(path.parent, _bash)
+        bash_script = _script_path_for_bash(path, _bash)
+        bash_command = (
+            f"set -o pipefail; cd {_quote_bash_literal(bash_cwd)} "
+            f"&& tr -d '\\r' < {_quote_bash_literal(bash_script)} | bash -s"
+        )
+        argv = [_bash, "-lc", bash_command]
     else:
         argv = [sys.executable, str(path)]
 

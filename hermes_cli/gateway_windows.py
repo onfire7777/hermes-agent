@@ -188,6 +188,16 @@ def _startup_dir() -> Path:
 
 def get_startup_entry_path() -> Path:
     _assert_windows()
+    return _startup_dir() / f"{_sanitize_filename(get_task_name())}.vbs"
+
+
+def get_legacy_startup_entry_path() -> Path:
+    """Old Startup-folder fallback path used before the hidden launcher.
+
+    Keep this so install/status/uninstall can clean up older ``.cmd`` entries
+    that briefly opened or minimized command-prompt windows at login.
+    """
+    _assert_windows()
     return _startup_dir() / f"{_sanitize_filename(get_task_name())}.cmd"
 
 
@@ -230,14 +240,73 @@ def _build_gateway_cmd_script(
     return "\r\n".join(lines) + "\r\n"
 
 
+def _quote_vbs_string(value: str) -> str:
+    """Return a VBScript string literal for ``value``."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_windows_command_arg(value: str) -> str:
+    """Quote one command-line argument for WScript.Shell.Run."""
+    if not value:
+        return '""'
+    if not re.search(r'[ \t"]', value):
+        return value
+    return '"' + value.replace('"', '""') + '"'
+
+
 def _build_startup_launcher(script_path: Path) -> str:
-    """The tiny .cmd that goes in the Startup folder. Just minimizes and chains."""
+    """Hidden low-overhead Startup-folder watchdog launcher.
+
+    The Scheduled Task backend is preferred when Windows allows it. On locked
+    down user accounts, the Startup fallback must not show command prompts, and
+    it should keep cron reliable if the gateway exits later. A tiny WScript
+    watchdog does that with one WMI scan every 10 minutes.
+
+    ``script_path`` is accepted for API compatibility with older callers; the
+    VBS launches pythonw.exe directly so there is no cmd.exe window.
+    """
+    argv, working_dir, env_overlay = _build_gateway_argv()
+    command = " ".join(_quote_windows_command_arg(arg) for arg in argv)
+    check_interval_ms = 600000
     lines = [
-        "@echo off",
-        f"rem {_TASK_DESCRIPTION}",
-        # ``start "" /min`` detaches with a minimized console window.
-        # ``/d /c`` on cmd.exe skips AUTORUN and runs the target script once.
-        f'start "" /min cmd.exe /d /c {_quote_cmd_script_arg(str(script_path))}',
+        "Option Explicit",
+        "",
+        "Dim shell, env, wmi, command, hermesDir, checkIntervalMs",
+        'Set shell = CreateObject("WScript.Shell")',
+        'Set env = shell.Environment("PROCESS")',
+        'Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")',
+        "",
+        f"hermesDir = {_quote_vbs_string(working_dir)}",
+        f"command = {_quote_vbs_string(command)}",
+        f"checkIntervalMs = {check_interval_ms}",
+        "",
+        f'env("HERMES_HOME") = {_quote_vbs_string(env_overlay["HERMES_HOME"])}',
+        f'env("PYTHONIOENCODING") = {_quote_vbs_string(env_overlay["PYTHONIOENCODING"])}',
+        f'env("HERMES_GATEWAY_DETACHED") = {_quote_vbs_string(env_overlay["HERMES_GATEWAY_DETACHED"])}',
+        f'env("VIRTUAL_ENV") = {_quote_vbs_string(env_overlay["VIRTUAL_ENV"])}',
+        "shell.CurrentDirectory = hermesDir",
+        "",
+        "Function GatewayRunning()",
+        "  Dim processes, process, cmd",
+        "  GatewayRunning = False",
+        '  Set processes = wmi.ExecQuery("SELECT CommandLine FROM Win32_Process WHERE Name=\'python.exe\' OR Name=\'pythonw.exe\'")',
+        "  For Each process In processes",
+        "    If Not IsNull(process.CommandLine) Then",
+        "      cmd = LCase(process.CommandLine)",
+        '      If InStr(cmd, "\\.hermes\\hermes-agent") > 0 And InStr(cmd, "hermes_cli.main gateway run") > 0 Then',
+        "        GatewayRunning = True",
+        "        Exit Function",
+        "      End If",
+        "    End If",
+        "  Next",
+        "End Function",
+        "",
+        "Do",
+        "  If Not GatewayRunning() Then",
+        "    shell.Run command, 0, False",
+        "  End If",
+        "  WScript.Sleep checkIntervalMs",
+        "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -325,6 +394,10 @@ def _install_startup_entry(script_path: Path) -> Path:
     entry = get_startup_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text(_build_startup_launcher(script_path), encoding="utf-8", newline="")
+    try:
+        get_legacy_startup_entry_path().unlink()
+    except FileNotFoundError:
+        pass
     return entry
 
 
@@ -543,6 +616,7 @@ def uninstall() -> None:
     task_name = get_task_name()
     script_path = get_task_script_path()
     startup_entry = get_startup_entry_path()
+    legacy_startup_entry = get_legacy_startup_entry_path()
 
     if is_task_registered():
         code, _out, err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
@@ -551,7 +625,11 @@ def uninstall() -> None:
         else:
             print(f"⚠ schtasks /Delete returned code {code}: {err.strip()}")
 
-    for path, label in [(startup_entry, "Windows login item"), (script_path, "Task script")]:
+    for path, label in [
+        (startup_entry, "Windows login item"),
+        (legacy_startup_entry, "legacy Windows login item"),
+        (script_path, "Task script"),
+    ]:
         try:
             path.unlink()
             print(f"✓ Removed {label}: {path}")
@@ -569,7 +647,7 @@ def is_task_registered() -> bool:
 
 
 def is_startup_entry_installed() -> bool:
-    return get_startup_entry_path().exists()
+    return get_startup_entry_path().exists() or get_legacy_startup_entry_path().exists()
 
 
 def is_installed() -> bool:
@@ -622,7 +700,12 @@ def status(deep: bool = False) -> None:
                 if key in info:
                     print(f"  {key.title()}: {info[key]}")
     elif startup_installed:
-        print(f"✓ Windows login item installed: {get_startup_entry_path()}")
+        startup_path = (
+            get_startup_entry_path()
+            if get_startup_entry_path().exists()
+            else get_legacy_startup_entry_path()
+        )
+        print(f"✓ Windows login item installed: {startup_path}")
     else:
         print("✗ Gateway service not installed")
 
@@ -636,6 +719,7 @@ def status(deep: bool = False) -> None:
         print(f"  Task name:     {task_name}")
         print(f"  Task script:   {get_task_script_path()}")
         print(f"  Startup entry: {get_startup_entry_path()}")
+        print(f"  Legacy entry:  {get_legacy_startup_entry_path()}")
 
     if not task_installed and not startup_installed and not pids:
         print()
