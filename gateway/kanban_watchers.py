@@ -1086,10 +1086,8 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _spawnable_ready_boards() -> set[str]:
+            """Return board slugs with ready/review work the dispatcher can spawn.
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -1102,15 +1100,16 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            ready_boards: set[str] = set()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
-                        return True
+                        ready_boards.add(slug)
                     if _kb.has_spawnable_review(conn):
-                        return True
+                        ready_boards.add(slug)
                 except Exception:
                     continue
                 finally:
@@ -1119,7 +1118,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return ready_boards
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1283,10 +1282,12 @@ class GatewayKanbanWatchersMixin:
                 else:
                     last_admission_pause_key = None
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
+                ready_board_slugs = await asyncio.to_thread(
+                    _spawnable_ready_boards
+                )
                 if _dispatcher_tick_is_bad(
-                    dispatch_results,
-                    ready_pending=ready_pending,
+                    results,
+                    ready_board_slugs=ready_board_slugs,
                     any_spawned=any_spawned,
                 ):
                     bad_ticks += 1
@@ -1323,14 +1324,22 @@ class GatewayKanbanWatchersMixin:
 
 
 def _dispatcher_tick_is_bad(
-    dispatch_results, *, ready_pending: bool, any_spawned: bool
+    dispatch_results, *, ready_board_slugs: set[str], any_spawned: bool
 ) -> bool:
     """Return true only for zero-spawn ticks without intentional backpressure."""
-    admission_paused = bool(dispatch_results) and all(
-        getattr(res, "adaptive_admission_paused", False)
-        for res in dispatch_results
+    results_by_slug = dict(dispatch_results or ())
+    intentionally_deferred = bool(ready_board_slugs) and all(
+        (res := results_by_slug.get(slug)) is not None
+        and (
+            getattr(res, "adaptive_admission_paused", False)
+            or (
+                bool(getattr(res, "skipped_per_profile_capped", ()))
+                and not getattr(res, "skipped_unassigned", ())
+            )
+        )
+        for slug in ready_board_slugs
     )
-    return bool(ready_pending and not any_spawned and not admission_paused)
+    return bool(ready_board_slugs and not any_spawned and not intentionally_deferred)
 
 
 def _admission_pause_reason_key(reason: str) -> tuple[str, ...]:

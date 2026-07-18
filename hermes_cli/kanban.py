@@ -2341,10 +2341,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 def _dispatcher_tick_is_bad(res, ready_pending: bool) -> bool:
     """Classify only unintentional zero-spawn ticks as unhealthy."""
+    intentionally_deferred = (
+        res.adaptive_admission_paused
+        or (
+            bool(res.skipped_per_profile_capped)
+            and not res.skipped_unassigned
+        )
+    )
     return bool(
         ready_pending
         and not res.spawned
-        and not res.adaptive_admission_paused
+        and not intentionally_deferred
     )
 
 

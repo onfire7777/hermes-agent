@@ -54,7 +54,7 @@ def test_dispatch_result_records_intentional_admission_pause(
     )
 
 
-def test_cli_health_treats_admission_pause_as_healthy():
+def test_cli_health_classifies_intentional_backpressure_precisely():
     from hermes_cli import kanban
 
     paused = kb.DispatchResult(
@@ -63,11 +63,27 @@ def test_cli_health_treats_admission_pause_as_healthy():
     )
     assert kanban._dispatcher_tick_is_bad(paused, ready_pending=True) is False
 
-    unpaused = kb.DispatchResult()
-    assert kanban._dispatcher_tick_is_bad(unpaused, ready_pending=True) is True
+    capped = kb.DispatchResult(
+        skipped_per_profile_capped=[("P4D", "default", 2)]
+    )
+    assert kanban._dispatcher_tick_is_bad(capped, ready_pending=True) is False
+
+    capped_and_unassigned = kb.DispatchResult(
+        skipped_per_profile_capped=[("P4D", "default", 2)],
+        skipped_unassigned=["P5"],
+    )
+    assert (
+        kanban._dispatcher_tick_is_bad(
+            capped_and_unassigned, ready_pending=True
+        )
+        is True
+    )
+
+    unassigned = kb.DispatchResult(skipped_unassigned=["P5"])
+    assert kanban._dispatcher_tick_is_bad(unassigned, ready_pending=True) is True
 
 
-def test_gateway_health_treats_only_admission_pause_as_healthy():
+def test_gateway_health_classifies_each_board_conservatively():
     from gateway.kanban_watchers import (
         _admission_pause_reason_key,
         _dispatcher_tick_is_bad,
@@ -75,10 +91,41 @@ def test_gateway_health_treats_only_admission_pause_as_healthy():
 
     paused = kb.DispatchResult(adaptive_admission_paused=True)
     assert _dispatcher_tick_is_bad(
-        [paused], ready_pending=True, any_spawned=False
+        [("mnemosyne", paused)],
+        ready_board_slugs={"mnemosyne"},
+        any_spawned=False,
+    ) is False
+
+    capped = kb.DispatchResult(
+        skipped_per_profile_capped=[("P4D", "default", 2)]
+    )
+    assert _dispatcher_tick_is_bad(
+        [("mnemosyne", capped), ("cookai", kb.DispatchResult())],
+        ready_board_slugs={"mnemosyne"},
+        any_spawned=False,
     ) is False
     assert _dispatcher_tick_is_bad(
-        [kb.DispatchResult()], ready_pending=True, any_spawned=False
+        [("cookai", kb.DispatchResult())],
+        ready_board_slugs=set(),
+        any_spawned=False,
+    ) is False
+
+    unassigned = kb.DispatchResult(skipped_unassigned=["P5"])
+    assert _dispatcher_tick_is_bad(
+        [("mnemosyne", unassigned)],
+        ready_board_slugs={"mnemosyne"},
+        any_spawned=False,
+    ) is True
+    assert _dispatcher_tick_is_bad(
+        [("mnemosyne", capped), ("cookai", kb.DispatchResult())],
+        ready_board_slugs={"mnemosyne", "cookai"},
+        any_spawned=False,
+    ) is True
+
+    assert _dispatcher_tick_is_bad(
+        [("mnemosyne", None)],
+        ready_board_slugs={"mnemosyne"},
+        any_spawned=False,
     ) is True
     assert _admission_pause_reason_key("load1 42.9 > 10.0") == ("load1",)
     assert _admission_pause_reason_key("load1 37.8 > 10.0") == ("load1",)
