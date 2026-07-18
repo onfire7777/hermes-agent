@@ -138,6 +138,86 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _free_memory_percent() -> Optional[float]:
+    """Return host free/available memory percentage for dispatch admission.
+
+    The dispatcher must not claim work that the lane adapter will immediately
+    defer on the same host resource rail.  macOS exposes the value through
+    ``memory_pressure``; Linux hosts use MemAvailable from ``/proc/meminfo``.
+    Measurement failure returns ``None`` so callers can choose a conservative
+    fallback instead of pretending the host is healthy.
+    """
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["memory_pressure", "-Q"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            match = re.search(r"free percentage:\s*([0-9]+(?:\.[0-9]+)?)%", result.stdout)
+            if match:
+                return float(match.group(1))
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            values: dict[str, float] = {}
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.partition(":")
+                if not _:
+                    continue
+                number = raw.strip().split()[0]
+                values[key] = float(number)
+            total = values.get("MemTotal")
+            available = values.get("MemAvailable")
+            if total and available is not None:
+                return available / total * 100.0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def adaptive_dispatch_cap(
+    configured: Optional[int],
+    *,
+    enabled: bool = False,
+    base: int = 3,
+    maximum: int = 6,
+    min_free_percent: float = 35.0,
+    max_load1: float = 10.0,
+) -> Optional[int]:
+    """Apply the shared 3→6 writer admission rail before claiming tasks.
+
+    ``0`` means the dispatcher should perform maintenance/recovery only and
+    claim no new work this tick.  A missing measurement falls back to the
+    conservative base cap, while a measured resource violation fails closed.
+    """
+    if not enabled or configured is None:
+        return configured
+    configured = max(int(configured), 0)
+    base = max(int(base), 1)
+    maximum = max(int(maximum), base)
+    ceiling = min(configured, maximum)
+    if ceiling == 0:
+        return 0
+    free = _free_memory_percent()
+    try:
+        load1 = float(os.getloadavg()[0])
+    except (OSError, IndexError):
+        load1 = None
+    if free is None or load1 is None:
+        return min(ceiling, base)
+    if free < min_free_percent or load1 > max_load1:
+        return 0
+    conservative = min(ceiling, base)
+    expanded = min(ceiling, base + 1)
+    if free < 45.0 or load1 > 8.0:
+        return conservative
+    if free < 55.0 or load1 > 6.0:
+        return expanded
+    return ceiling
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -7449,6 +7529,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    adaptive_max_spawn: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7483,6 +7564,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            adaptive_max_spawn=adaptive_max_spawn,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7499,6 +7581,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            adaptive_max_spawn=adaptive_max_spawn,
         )
 
 
@@ -7515,6 +7598,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    adaptive_max_spawn: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7572,6 +7656,16 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    if adaptive_max_spawn and max_spawn is not None:
+        requested_max_spawn = max_spawn
+        max_spawn = adaptive_dispatch_cap(max_spawn, enabled=True)
+        if max_spawn != requested_max_spawn:
+            _log.info(
+                "kanban adaptive admission: max_spawn %s -> %s",
+                requested_max_spawn,
+                max_spawn,
+            )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8364,6 +8458,7 @@ def run_daemon(
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    adaptive_max_spawn: bool = False,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -8401,6 +8496,7 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    adaptive_max_spawn=adaptive_max_spawn,
                 )
             if on_tick is not None:
                 try:

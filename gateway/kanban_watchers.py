@@ -831,6 +831,13 @@ class GatewayKanbanWatchersMixin:
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
+        adaptive_max_spawn = bool(kanban_cfg.get("adaptive_max_spawn", False))
+        if adaptive_max_spawn:
+            logger.info(
+                "kanban dispatcher: adaptive max_spawn admission enabled "
+                "(3->6 writer rail, fail-closed on host pressure)"
+            )
+
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
         # out. When set, the dispatcher skips spawning when the board
@@ -1022,6 +1029,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    adaptive_max_spawn=adaptive_max_spawn,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
