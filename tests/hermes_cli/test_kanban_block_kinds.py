@@ -17,11 +17,13 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban
 
 
 @pytest.fixture
@@ -160,6 +162,179 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         kb.complete_task(conn, parent, result="done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Transient automatic retry routing
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_transient_deferrals_never_triage_or_count_failures(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        for attempt in range(1, 5):
+            assert kb.block_task(
+                conn, tid, reason="host below admission floor", kind="transient",
+            )
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready"
+            assert task.block_recurrences == attempt
+            assert task.consecutive_failures == 0
+            assert task.claim_lock is None
+            assert task.claim_expires is None
+            assert task.worker_pid is None
+            assert task.current_run_id is None
+            run = conn.execute(
+                "SELECT status, outcome FROM task_runs WHERE task_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert (run["status"], run["outcome"]) == (
+                "transient_deferred", "transient_deferred",
+            )
+            assert not any(
+                event.kind == "block_loop_detected"
+                for event in kb.list_events(conn, tid)
+            )
+            _make_running_again(conn, tid)
+
+
+def test_transient_with_unfinished_parent_returns_to_todo(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        assert kb.block_task(conn, child, reason="memory pressure", kind="transient")
+        assert kb.get_task(conn, child).status == "todo"
+        event = next(
+            e for e in reversed(kb.list_events(conn, child))
+            if e.kind == "transient_deferred"
+        )
+        assert event.payload["retry_status"] == "todo"
+
+
+def test_transient_respawn_guard_exponential_cooldown_and_cap(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="busy", kind="transient")
+        assert kb.check_respawn_guard(conn, tid) == "transient_retry_cooldown"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (now - 300, tid),
+            )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        assert kb._transient_retry_cooldown_seconds(2) == 600
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_recurrences=99 WHERE id=?", (tid,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (now - 3599, tid),
+            )
+        assert kb._transient_retry_cooldown_seconds(99) == 3600
+        assert kb.check_respawn_guard(conn, tid) == "transient_retry_cooldown"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (now - 3600, tid),
+            )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_rate_limited_cooldown_remains_flat(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 2_000_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status='rate_limited', outcome='rate_limited', "
+                "ended_at=? WHERE task_id=?",
+                (now - 299, tid),
+            )
+            conn.execute(
+                "UPDATE tasks SET block_recurrences=99 WHERE id=?", (tid,),
+            )
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                (now - 300, tid),
+            )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_block_help_describes_transient_as_deferred_retry() -> None:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+    kanban_parser = kanban.build_parser(subparsers)
+    block_parser = next(
+        action.choices["block"]
+        for action in kanban_parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    help_text = block_parser.format_help()
+    assert "transient' defers and automatically retries" in help_text
+    assert "never human-blocked or triaged" in help_text
+    assert "maybe-flaky failure" not in help_text
+
+
+@pytest.mark.parametrize(
+    ("parent_unfinished", "expected_status", "expected_output"),
+    [
+        (
+            False,
+            "ready",
+            "transient deferred — automatic retry after cooldown",
+        ),
+        (True, "todo", "transient deferred — waiting on parents"),
+    ],
+)
+def test_cmd_block_transient_reports_deferral_and_comment(
+    kanban_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    parent_unfinished: bool,
+    expected_status: str,
+    expected_output: str,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        if parent_unfinished:
+            parent = kb.create_task(conn, title="parent", assignee="worker")
+            kb.link_tasks(conn, parent_id=parent, child_id=tid)
+
+    args = argparse.Namespace(
+        task_id=tid,
+        reason=["memory", "admission", "rail"],
+        kind="transient",
+        ids=None,
+    )
+    assert kanban._cmd_block(args) == 0
+    output = capsys.readouterr().out
+    assert expected_output in output
+    assert "Blocked" not in output
+    assert "dependency wait" not in output
+
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == expected_status
+        comments = kb.list_comments(conn, tid)
+        assert comments[-1].body == "DEFERRED: memory admission rail"
 
 
 # ---------------------------------------------------------------------------

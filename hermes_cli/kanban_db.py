@@ -115,7 +115,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
-#   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``transient``    — a temporary deferral that automatically retries.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
@@ -132,6 +132,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+TRANSIENT_RETRY_COOLDOWN_CAP_SECONDS = 60 * 60
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -379,6 +380,17 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _transient_retry_cooldown_seconds(attempt: int) -> int:
+    """Return the bounded exponential cooldown for a transient deferral."""
+    base = _resolve_rate_limit_cooldown_seconds()
+    if base <= 0:
+        return 0
+    # Twelve doublings already exceed the one-hour cap for any positive
+    # integer base; bounding here also keeps corrupt counters cheap to handle.
+    exponent = min(max(0, int(attempt) - 1), 12)
+    return min(base * (2 ** exponent), TRANSIENT_RETRY_COOLDOWN_CAP_SECONDS)
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -5006,12 +5018,13 @@ def block_task(
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` — a non-failure deferral. The active run closes as
+      ``transient_deferred`` and the task returns to ``ready`` when its parents
+      are complete, otherwise ``todo``. It never enters human triage; the
+      respawn guard applies a bounded exponential cooldown before retrying.
 
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Returns True on any successful transition (to ``blocked``, ``todo``,
+    ``ready``, or ``triage``), False when the task wasn't blockable.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -5077,6 +5090,57 @@ def block_task(
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
+            )
+            return True
+
+        if kind == "transient":
+            parents = conn.execute(
+                "SELECT t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            routed_to = (
+                "ready"
+                if all(p["status"] in ("done", "archived") for p in parents)
+                else "todo"
+            )
+            recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+            params = (routed_to, kind, recurrences, task_id)
+            expected_clause = ""
+            if expected_run_id is not None:
+                expected_clause = " AND current_run_id = ?"
+                params += (int(expected_run_id),)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?, claim_lock = NULL, claim_expires = NULL,
+                       worker_pid = NULL, block_kind = ?, block_recurrences = ?,
+                       consecutive_failures = 0, last_failure_error = NULL
+                 WHERE id = ? AND status IN ('running', 'ready')
+                """ + expected_clause,
+                params,
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id, outcome="transient_deferred",
+                status="transient_deferred", summary=reason,
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="transient_deferred", summary=reason,
+                )
+            _append_event(
+                conn, task_id, "transient_deferred",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "attempt": recurrences,
+                    "retry_status": routed_to,
+                    "cooldown_seconds": _transient_retry_cooldown_seconds(recurrences),
+                },
+                run_id=run_id,
             )
             return True
 
@@ -7362,6 +7426,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     Checks in priority order:
 
+    ``"transient_retry_cooldown"``
+        The latest run was explicitly deferred as transient. Retry delay grows
+        exponentially from the configured rate-limit cooldown, capped at one
+        hour. This does not affect the flat provider rate-limit cooldown.
+
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
@@ -7427,7 +7496,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
@@ -7447,6 +7516,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # stamped on the task; this path intentionally retries forever
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
+        return None
+
+    if latest_run is not None and latest_run["outcome"] == "transient_deferred":
+        attempt_row = conn.execute(
+            "SELECT block_recurrences FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        attempt = int(attempt_row["block_recurrences"] or 1)
+        cooldown = _transient_retry_cooldown_seconds(attempt)
+        ended_at = latest_run["ended_at"]
+        if (
+            cooldown > 0
+            and ended_at is not None
+            and (now - int(ended_at)) < cooldown
+        ):
+            return "transient_retry_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.

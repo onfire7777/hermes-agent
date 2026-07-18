@@ -582,9 +582,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
             "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
-            "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "blocked for a human; 'transient' defers and automatically retries "
+            "with cooldown (never human-blocked or triaged). Repeated same-kind "
+            "human re-blocks after unblock route the task to triage. Omit for "
+            "a generic block."
         ),
     )
 
@@ -2044,7 +2045,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+                prefix = "DEFERRED" if kind == "transient" else "BLOCKED"
+                kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
             if not kb.block_task(
                 conn,
                 tid,
@@ -2060,7 +2062,17 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 landed = kb.get_task(conn, tid)
                 where = landed.status if landed else "blocked"
                 suffix = f": {reason}" if reason else ""
-                if where == "todo":
+                if kind == "transient" and where == "ready":
+                    print(
+                        f"{tid} → ready (transient deferred — automatic retry "
+                        f"after cooldown){suffix}"
+                    )
+                elif kind == "transient" and where == "todo":
+                    print(
+                        f"{tid} → todo (transient deferred — waiting on "
+                        f"parents){suffix}"
+                    )
+                elif where == "todo":
                     print(f"{tid} → todo (dependency wait){suffix}")
                 elif where == "triage":
                     print(
