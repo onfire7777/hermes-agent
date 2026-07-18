@@ -2283,6 +2283,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "adaptive_admission_paused": res.adaptive_admission_paused,
+            "adaptive_admission_reason": res.adaptive_admission_reason,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2320,7 +2322,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.adaptive_admission_paused:
+        print(f"Adaptive admission paused: {res.adaptive_admission_reason}")
     return 0
+
+
+def _dispatcher_tick_is_bad(res, ready_pending: bool) -> bool:
+    """Classify only unintentional zero-spawn ticks as unhealthy."""
+    return bool(
+        ready_pending
+        and not res.spawned
+        and not res.adaptive_admission_paused
+    )
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -2393,8 +2406,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        if _dispatcher_tick_is_bad(res, ready_pending):
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0

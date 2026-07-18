@@ -947,6 +947,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        last_admission_pause_reason = None
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1242,7 +1243,10 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                dispatch_results = []
                 for slug, res in (results or []):
+                    if res is not None:
+                        dispatch_results.append(res)
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually
@@ -1258,9 +1262,32 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                admission_paused = bool(dispatch_results) and all(
+                    getattr(res, "adaptive_admission_paused", False)
+                    for res in dispatch_results
+                )
+                if admission_paused:
+                    pause_reason = "; ".join(sorted({
+                        str(
+                            getattr(res, "adaptive_admission_reason", None)
+                            or "resource pressure"
+                        )
+                        for res in dispatch_results
+                    }))
+                    if pause_reason != last_admission_pause_reason:
+                        logger.info(
+                            "kanban dispatcher admission paused: %s", pause_reason
+                        )
+                    last_admission_pause_reason = pause_reason
+                else:
+                    last_admission_pause_reason = None
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                if _dispatcher_tick_is_bad(
+                    dispatch_results,
+                    ready_pending=ready_pending,
+                    any_spawned=any_spawned,
+                ):
                     bad_ticks += 1
                 else:
                     bad_ticks = 0
@@ -1292,3 +1319,14 @@ class GatewayKanbanWatchersMixin:
 
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None
+
+
+def _dispatcher_tick_is_bad(
+    dispatch_results, *, ready_pending: bool, any_spawned: bool
+) -> bool:
+    """Return true only for zero-spawn ticks without intentional backpressure."""
+    admission_paused = bool(dispatch_results) and all(
+        getattr(res, "adaptive_admission_paused", False)
+        for res in dispatch_results
+    )
+    return bool(ready_pending and not any_spawned and not admission_paused)

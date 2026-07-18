@@ -192,30 +192,55 @@ def adaptive_dispatch_cap(
     claim no new work this tick.  A missing measurement falls back to the
     conservative base cap, while a measured resource violation fails closed.
     """
+    return _adaptive_dispatch_decision(
+        configured,
+        enabled=enabled,
+        base=base,
+        maximum=maximum,
+        min_free_percent=min_free_percent,
+        max_load1=max_load1,
+    )[0]
+
+
+def _adaptive_dispatch_decision(
+    configured: Optional[int],
+    *,
+    enabled: bool = False,
+    base: int = 3,
+    maximum: int = 6,
+    min_free_percent: float = 35.0,
+    max_load1: float = 10.0,
+) -> tuple[Optional[int], Optional[str]]:
+    """Return the adaptive cap and an intentional-pause diagnostic."""
     if not enabled or configured is None:
-        return configured
+        return configured, None
     configured = max(int(configured), 0)
     base = max(int(base), 1)
     maximum = max(int(maximum), base)
     ceiling = min(configured, maximum)
     if ceiling == 0:
-        return 0
+        return 0, None
     free = _free_memory_percent()
     try:
         load1 = float(os.getloadavg()[0])
     except (OSError, IndexError):
         load1 = None
     if free is None or load1 is None:
-        return min(ceiling, base)
+        return min(ceiling, base), None
     if free < min_free_percent or load1 > max_load1:
-        return 0
+        reasons = []
+        if free < min_free_percent:
+            reasons.append(f"free memory {free:.1f}% < {min_free_percent:.1f}%")
+        if load1 > max_load1:
+            reasons.append(f"load1 {load1:.1f} > {max_load1:.1f}")
+        return 0, "; ".join(reasons)
     conservative = min(ceiling, base)
     expanded = min(ceiling, base + 1)
     if free < 45.0 or load1 > 8.0:
-        return conservative
+        return conservative, None
     if free < 55.0 or load1 > 6.0:
-        return expanded
-    return ceiling
+        return expanded, None
+    return ceiling, None
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -6159,6 +6184,10 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    adaptive_admission_paused: bool = False
+    """True when host pressure intentionally reduced the adaptive cap to 0."""
+    adaptive_admission_reason: Optional[str] = None
+    """Concise host-pressure reason for intentional admission backpressure."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7676,12 +7705,18 @@ def _dispatch_once_locked(
 
     if adaptive_max_spawn and max_spawn is not None:
         requested_max_spawn = max_spawn
-        max_spawn = adaptive_dispatch_cap(max_spawn, enabled=True)
+        max_spawn, pause_reason = _adaptive_dispatch_decision(
+            max_spawn, enabled=True
+        )
+        if requested_max_spawn > 0 and max_spawn == 0 and pause_reason:
+            result.adaptive_admission_paused = True
+            result.adaptive_admission_reason = pause_reason
         if max_spawn != requested_max_spawn:
             _log.info(
-                "kanban adaptive admission: max_spawn %s -> %s",
+                "kanban adaptive admission: max_spawn %s -> %s%s",
                 requested_max_spawn,
                 max_spawn,
+                f" ({pause_reason})" if pause_reason else "",
             )
 
     # Count tasks already running so max_spawn enforces concurrency rather
