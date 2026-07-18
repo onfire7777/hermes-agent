@@ -808,17 +808,22 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
 
 
 def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
-    """`dependency` and `needs_input` represent a genuine external blocker
-    the worker cannot resolve itself — these remain ungated.
+    """A declared unfinished dependency is a genuine external blocker.
 
-    `dependency` routes to status='todo' (not 'blocked') per block_task's
-    own kind-routing — the goal loop still treats anything outside
-    running/ready/done/blocked as a stop, so this is still a legitimate,
-    judge-free exit; it's just not the literal 'blocked' status."""
+    `dependency` routes to status='todo' only when the task actually has an
+    unfinished parent. Unlinked dependency claims fail closed in `blocked` and
+    are covered by the block-kind routing tests."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="unfinished prerequisite")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+    finally:
+        conn.close()
+
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
