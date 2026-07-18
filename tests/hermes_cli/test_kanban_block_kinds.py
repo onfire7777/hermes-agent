@@ -5,8 +5,8 @@ task, a cron unblocks it, the worker re-blocks for the same reason, repeat
 forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 ``block_recurrences`` counter:
 
-* ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
-  never enter the human ``blocked`` bucket a cron would keep unblocking.
+* ``dependency`` blocks route to ``todo`` only with an unfinished declared
+  parent; otherwise they fail closed instead of entering a respawn loop.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
@@ -138,13 +138,39 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 
 
 def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
-    """Dependency waits never enter the human 'blocked' bucket."""
+    """A represented unfinished dependency uses parent-gated todo routing."""
     with kb.connect_closing() as conn:
-        tid = _running_task(conn)
-        assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
-        t = kb.get_task(conn, tid)
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        assert kb.block_task(conn, child, reason="need X first", kind="dependency")
+        t = kb.get_task(conn, child)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
+
+
+def test_dependency_block_without_parent_fails_closed(kanban_home: Path) -> None:
+    """An undeclared dependency cannot immediately promote and respawn."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="external base hold", kind="dependency")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_dependency_block_with_done_parents_fails_closed(kanban_home: Path) -> None:
+    """A dependency claim beyond completed parents requires DAG repair."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        assert kb.block_task(conn, child, reason="external base hold", kind="dependency")
+        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "blocked"
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:

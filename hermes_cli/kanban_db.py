@@ -108,10 +108,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocks → worker re-blocks → cron unblocks … forever.
 #
 #   * ``dependency``   — can't proceed until another task finishes. Routed to
-#                        ``todo`` (NOT ``blocked``) so the existing
-#                        parent-gating / ``recompute_ready`` machinery promotes
-#                        it automatically once parents are done. No human, no
-#                        cron, no retry storm.
+#                        ``todo`` only when a declared parent is unfinished, so
+#                        parent-gating / ``recompute_ready`` can promote it.
+#                        Missing or already-finished DAG links fail closed in
+#                        ``blocked`` for an operator to repair explicitly.
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
@@ -5004,11 +5004,12 @@ def block_task(
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
 
-    * ``dependency`` — the task is only waiting on another task. It does NOT
-      sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
-      ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
-      promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+    * ``dependency`` — when at least one declared parent is unfinished, the
+      task goes to ``todo`` so parent-gating / ``recompute_ready`` promotes it
+      once its parents finish. If no declared parent is unfinished, the stated
+      dependency is not represented in the DAG; the task fails closed in
+      sticky ``blocked`` state until an operator links or unblocks it. This
+      prevents an immediate ``todo`` → ``ready`` → respawn loop.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -5047,15 +5048,23 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
+        # A dependency wait is auto-routable only when the DAG has an unfinished
+        # parent to gate it. With no such parent, ``all([])`` (or all parents
+        # already done) would make recompute_ready immediately respawn the task;
+        # fail closed and require the missing dependency link to be repaired.
         if kind == "dependency":
+            unfinished_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            routed_to = "todo" if unfinished_parent else "blocked"
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'todo',
+                   SET status        = ?,
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -5063,8 +5072,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (routed_to, kind, task_id) if expected_run_id is None
+                else (routed_to, kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5079,9 +5088,19 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "routed_to": routed_to},
+                run_id=run_id,
             )
-            routed_to = "todo"
+            if routed_to == "blocked":
+                _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "cause": "dependency_not_represented_in_dag",
+                    },
+                    run_id=run_id,
+                )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
