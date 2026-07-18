@@ -7349,7 +7349,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
         reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
+        next tick. An explicit unblock event at or after the latest ended run
+        bypasses stale error text: it records that an operator repaired the
+        blocker and deliberately requested another attempt. The existing
+        ``consecutive_failures`` counter still
         trips the auto-block circuit breaker after ``failure_limit``
         consecutive failures, so a persistent auth error eventually
         blocks via the normal path — but a transient 429 gets a few
@@ -7420,7 +7423,21 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        # ``unblock_task`` clears the error in its transaction, but a stale
+        # failure writer can restore it afterward.  Prefer the durable event
+        # ordering over destructive clearing: an unblock at/after the latest
+        # ended run is an explicit retry request, while a failure from a newer
+        # run still fails closed.  Counters and diagnostics remain intact.
+        unblocked_after_run = None
+        if latest_run is not None and latest_run["ended_at"] is not None:
+            unblocked_after_run = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND kind = 'unblocked' AND created_at >= ? "
+                "LIMIT 1",
+                (task_id, int(latest_run["ended_at"])),
+            ).fetchone()
+        if not unblocked_after_run:
+            return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator

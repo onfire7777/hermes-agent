@@ -1865,6 +1865,63 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
     assert reason == "blocker_auth"
 
 
+def test_respawn_guard_blocker_auth_bypassed_by_later_unblock(kanban_home):
+    """An explicit unblock after the failed run overrides stale auth text.
+
+    ``unblock_task`` clears ``last_failure_error`` transactionally, but a stale
+    worker/failure writer can restore the old error afterward.  The durable
+    unblock event is the operator's authoritative request to retry.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repaired-route", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, error, started_at, ended_at) "
+            "VALUES (?, 'blocked', 'blocked', ?, ?, ?)",
+            (t, "Authentication failed: invalid model route", now - 20, now - 10),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 5),
+        )
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 3, "
+            "last_failure_error = ? WHERE id = ?",
+            ("Authentication failed: invalid model route", t),
+        )
+
+        assert kb.check_respawn_guard(conn, t) is None
+        task = kb.get_task(conn, t)
+        assert task.consecutive_failures == 3
+        assert task.last_failure_error == "Authentication failed: invalid model route"
+
+
+def test_respawn_guard_blocker_auth_not_bypassed_by_older_unblock(kanban_home):
+    """A newer auth failure still fails closed after an earlier unblock."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="still-broken-route", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'unblocked', ?)",
+            (t, now - 20),
+        )
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, error, started_at, ended_at) "
+            "VALUES (?, 'blocked', 'blocked', ?, ?, ?)",
+            (t, "401 unauthorized", now - 10, now - 5),
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = '401 unauthorized' WHERE id = ?",
+            (t,),
+        )
+
+        assert kb.check_respawn_guard(conn, t) == "blocker_auth"
+
+
 def test_respawn_guard_recent_success(kanban_home):
     """A completed run within the guard window triggers recent_success."""
     with kb.connect() as conn:
