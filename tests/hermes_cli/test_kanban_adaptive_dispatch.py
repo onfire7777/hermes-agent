@@ -77,6 +77,35 @@ def test_dispatch_result_records_first_spawn_failure(tmp_path, monkeypatch):
     assert result.auto_blocked == []
 
 
+def test_dispatch_result_records_first_review_spawn_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (Path(tmp_path) / "profiles" / "default").mkdir(parents=True)
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="review fails", assignee="default")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (task_id,),
+            )
+
+    def fail_spawn(*_args, **_kwargs):
+        raise RuntimeError("review provider unavailable")
+
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fail_spawn,
+            failure_limit=2,
+        )
+
+    assert result.spawn_failed == [task_id]
+    assert result.auto_blocked == []
+
+
 def test_cli_health_classifies_intentional_backpressure_precisely():
     from hermes_cli import kanban
 

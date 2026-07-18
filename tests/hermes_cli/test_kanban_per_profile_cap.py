@@ -135,6 +135,37 @@ def test_ready_and_review_tasks_share_profile_cap(
     ]
 
 
+def test_real_ready_spawn_caps_review_worker(
+    isolated_kanban_home_with_profiles,
+):
+    """The shared cap also holds after a real ready-task claim."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        ready_id = kb.create_task(conn, title="ready", assignee="alpha")
+        review_id = kb.create_task(conn, title="review", assignee="alpha")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                (review_id,),
+            )
+
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
+            max_in_progress_per_profile=1,
+        )
+        ready = kb.get_task(conn, ready_id)
+        review = kb.get_task(conn, review_id)
+
+    assert [task_id for task_id, _, _ in result.spawned] == [ready_id]
+    assert result.skipped_per_profile_capped == [(review_id, "alpha", 1)]
+    assert ready is not None and ready.status == "running"
+    assert review is not None and review.status == "review"
+
+
 @pytest.mark.parametrize("cap", [0, -1, "abc", None])
 def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     """Cap values that don't represent a positive int should be treated as
