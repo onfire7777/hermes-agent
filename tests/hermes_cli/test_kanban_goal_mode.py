@@ -296,3 +296,270 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+def test_loop_waits_for_process_local_session_without_spending_turn(monkeypatch):
+    seen = {}
+    waits = iter([True, False])
+    statuses = iter(["running", "running", "running", "done"])
+
+    def _background_processes(task_id=None, session_key=None):
+        seen["task_id"] = task_id
+        seen["session_key"] = session_key
+        return [{"session_id": "proc_ralphex", "status": "running"}]
+
+    monkeypatch.setattr(goals, "gather_background_processes", _background_processes)
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: next(waits))
+    monkeypatch.setattr(goals.time, "sleep", lambda seconds: seen.setdefault("sleep", seconds))
+
+    def _judge(_goal, _response, *, background_processes=None, **_kw):
+        seen["background"] = background_processes
+        return "wait", "RalphEx is still running", False, {"session_id": "proc_ralphex"}
+
+    monkeypatch.setattr(goals, "judge_goal", _judge)
+    turns = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t_wait_session",
+        session_key="conversation-a",
+        goal_text="finish bounded RalphEx lane",
+        run_turn=lambda p: turns.append(p) or "checked process output and completed",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("wait must not block the task"),
+        max_turns=2,
+        first_response="RalphEx is running in the background",
+    )
+
+    assert res["outcome"] == "completed_by_worker"
+    assert res["turns_used"] == 2
+    assert len(turns) == 1
+    assert seen["task_id"] is None
+    assert seen["session_key"] == "conversation-a"
+    assert seen["background"][0]["session_id"] == "proc_ralphex"
+    assert seen["sleep"] == 1.0
+
+
+def test_loop_waits_for_pid_then_resumes_after_exit(monkeypatch):
+    alive = iter([True, False])
+    statuses = iter(["running", "running", "running", "done"])
+    monkeypatch.setattr(
+        goals,
+        "gather_background_processes",
+        lambda task_id=None, session_key=None: [
+            {"pid": 4242, "status": "running", "session_key": session_key}
+        ],
+    )
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: next(alive))
+    monkeypatch.setattr(goals.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_a, **_kw: ("wait", "process running", False, {"pid": 4242}),
+    )
+
+    turns = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t_wait_pid",
+        session_key="conversation-b",
+        goal_text="finish subprocess",
+        run_turn=lambda p: turns.append(p) or "checked process output and completed",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("wait must not block the task"),
+        max_turns=2,
+        first_response="subprocess is running",
+    )
+
+    assert res["outcome"] == "completed_by_worker"
+    assert res["turns_used"] == 2
+    assert len(turns) == 1
+
+
+def test_loop_rejects_wait_target_not_in_live_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        goals,
+        "gather_background_processes",
+        lambda task_id=None, session_key=None: [
+            {"session_id": "real", "pid": 123, "status": "running"}
+        ],
+    )
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_a, **_kw: ("wait", "hallucinated", False, {"pid": 999}),
+    )
+    turns = []
+    statuses = iter(["running", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_reject_wait",
+        session_key="conversation-c",
+        goal_text="finish safely",
+        run_turn=lambda p: turns.append(p) or "done",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("must resume, not block"),
+        max_turns=2,
+        first_response="waiting",
+    )
+
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_outcome"),
+    [
+        ("done", "completed_by_worker"),
+        ("blocked", "blocked_by_worker"),
+        ("archived", "stopped"),
+    ],
+)
+def test_loop_returns_immediately_when_task_changes_during_wait(
+    monkeypatch, terminal_status, expected_outcome
+):
+    monkeypatch.setattr(
+        goals,
+        "gather_background_processes",
+        lambda **_kw: [{"session_id": "proc_wait", "status": "running"}],
+    )
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
+    monkeypatch.setattr(goals.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_a, **_kw: ("wait", "running", False, {"session_id": "proc_wait"}),
+    )
+    statuses = iter(["running", terminal_status])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_terminal_wait",
+        session_key="conversation-terminal",
+        goal_text="wait safely",
+        run_turn=lambda _p: pytest.fail("terminal transition must return immediately"),
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("loop must not mutate terminal task"),
+        max_turns=2,
+        first_response="waiting",
+    )
+    assert res["outcome"] == expected_outcome
+    assert res["turns_used"] == 1
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_outcome"),
+    [
+        ("done", "completed_by_worker"),
+        ("blocked", "blocked_by_worker"),
+        ("archived", "stopped"),
+    ],
+)
+def test_loop_rechecks_task_when_wait_target_is_already_released(
+    monkeypatch, terminal_status, expected_outcome
+):
+    monkeypatch.setattr(
+        goals,
+        "gather_background_processes",
+        lambda **_kw: [{"session_id": "proc_released", "status": "running"}],
+    )
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: False)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_a, **_kw: (
+            "wait",
+            "process just released",
+            False,
+            {"session_id": "proc_released"},
+        ),
+    )
+    statuses = iter(["running", terminal_status])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_release_race",
+        session_key="conversation-release",
+        goal_text="finish without racing",
+        run_turn=lambda _p: pytest.fail("terminal task must not consume a turn"),
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("loop must not mutate terminal task"),
+        max_turns=2,
+        first_response="waiting",
+    )
+    assert res["outcome"] == expected_outcome
+    assert res["turns_used"] == 1
+
+
+def test_loop_session_watch_trigger_releases_wait(monkeypatch):
+    waiting = iter([True, False])
+    statuses = iter(["running", "running", "running", "done"])
+    monkeypatch.setattr(
+        goals,
+        "gather_background_processes",
+        lambda **_kw: [{
+            "session_id": "proc_watch",
+            "status": "running",
+            "watch_patterns": ["READY"],
+        }],
+    )
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: next(waiting))
+    monkeypatch.setattr(goals.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda *_a, **_kw: ("wait", "watching", False, {"session_id": "proc_watch"}),
+    )
+    turns = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t_watch",
+        session_key="conversation-watch",
+        goal_text="wait for READY",
+        run_turn=lambda p: turns.append(p) or "finalized",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda _r: pytest.fail("must not block"),
+        max_turns=2,
+        first_response="watcher running",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+
+
+def test_cli_wrapper_forwards_stable_session_id(kanban_home, monkeypatch):
+    import cli as cli_mod
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="goal task",
+            body="finish it",
+            assignee="default",
+            goal_mode=True,
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    captured = {}
+    monkeypatch.setattr(
+        goals,
+        "run_kanban_goal_loop",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    turns = []
+
+    class _Agent:
+        def run_conversation(self, **kwargs):
+            from tools.approval import get_current_session_key
+
+            turns.append((get_current_session_key(default=""), kwargs))
+            return {"final_response": "continued"}
+
+    fake_cli = type(
+        "FakeCLI",
+        (),
+        {
+            "session_id": "stable-cli-session",
+            "conversation_history": [],
+            "agent": _Agent(),
+        },
+    )()
+
+    cli_mod._run_kanban_goal_loop_q(fake_cli, "started")
+    assert captured["task_id"] == task_id
+    assert captured["session_key"] == "stable-cli-session"
+    captured["run_turn"]("continue")
+    assert turns[0][0] == "stable-cli-session"
+    assert turns[0][1]["task_id"] == "stable-cli-session"

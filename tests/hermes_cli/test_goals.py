@@ -812,6 +812,31 @@ class TestWaitBarrier:
         """A PID that is essentially guaranteed not to be running."""
         return 2_000_000_000
 
+    def test_gather_background_processes_filters_by_session_and_live_status(
+        self, monkeypatch
+    ):
+        from hermes_cli.goals import gather_background_processes
+        from tools.process_registry import process_registry
+
+        seen = {}
+
+        def _list_sessions(*, task_id=None, session_key=None):
+            seen.update(task_id=task_id, session_key=session_key)
+            return [
+                {"session_id": "live", "status": "running"},
+                {"session_id": "done", "status": "exited"},
+            ]
+
+        monkeypatch.setattr(process_registry, "list_sessions", _list_sessions)
+        assert gather_background_processes(
+            task_id="effective-task",
+            session_key="stable-session",
+        ) == [{"session_id": "live", "status": "running"}]
+        assert seen == {
+            "task_id": "effective-task",
+            "session_key": "stable-session",
+        }
+
     def test_wait_on_requires_active_goal(self, hermes_home):
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="wb-noactive")

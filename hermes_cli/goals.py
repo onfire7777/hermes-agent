@@ -957,10 +957,13 @@ def judge_goal(
     return verdict, reason, parse_failed, wait_directive
 
 
-def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def gather_background_processes(
+    task_id: Optional[str] = None,
+    session_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Return the live background-process snapshot for the goal judge.
 
-    Thin, fail-safe wrapper over ``process_registry.list_sessions(task_id)``.
+    Thin, fail-safe wrapper over ``process_registry.list_sessions``.
     Returns only RUNNING processes (an exited one is nothing to wait on) and
     never raises — any import/registry failure yields ``[]`` so the goal loop
     degrades to its pre-wait-barrier behavior (judge just won't see processes).
@@ -970,11 +973,14 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     try:
         from tools.process_registry import process_registry
 
-        sessions = process_registry.list_sessions(task_id=task_id) or []
+        sessions = process_registry.list_sessions(
+            task_id=task_id,
+            session_key=session_key,
+        ) or []
     except Exception as exc:
         logger.debug("gather_background_processes failed: %s", exc)
         return []
-    return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
+    return [s for s in sessions if isinstance(s, dict) and s.get("status") == "running"]
 
 
 def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
@@ -1604,6 +1610,7 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 def run_kanban_goal_loop(
     *,
     task_id: str,
+    session_key: Optional[str] = None,
     goal_text: str,
     run_turn,
     task_status_fn,
@@ -1647,6 +1654,28 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
+    def _terminal_wait_result(status: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Map a task state observed at the wait barrier to a loop result."""
+        if status in ("running", "ready"):
+            return None
+        if status == "done":
+            return {
+                "outcome": "completed_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker completed the task while waiting",
+            }
+        if status == "blocked":
+            return {
+                "outcome": "blocked_by_worker",
+                "turns_used": turns_used,
+                "reason": "worker blocked the task while waiting",
+            }
+        return {
+            "outcome": "stopped",
+            "turns_used": turns_used,
+            "reason": f"status={status}",
+        }
+
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
@@ -1675,13 +1704,81 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
-        # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
+        # Background work is isolated by the stable conversation session key.
+        # Without it, fail closed: do not let unrelated registry entries defer
+        # the Kanban terminal-state contract.
+        background_processes = (
+            gather_background_processes(session_key=session_key)
+            if session_key
+            else []
+        )
+        verdict, reason, _parse_failed, _wait = judge_goal(
+            goal_text,
+            last_response,
+            background_processes=background_processes,
+        )
         if verdict == "wait":
-            verdict = "continue"
+            directive = _wait or {}
+            wait_session = str(directive.get("session_id") or "").strip()
+            try:
+                wait_pid = int(directive.get("pid") or 0)
+            except (TypeError, ValueError):
+                wait_pid = 0
+
+            # Never park on a judge-hallucinated process. The requested target
+            # must be present in the exact live snapshot shown to the judge.
+            session_is_live = bool(wait_session) and any(
+                str(p.get("session_id") or "") == wait_session
+                for p in background_processes
+            )
+            pid_is_live = wait_pid > 0 and any(
+                int(p.get("pid") or 0) == wait_pid
+                for p in background_processes
+                if str(p.get("pid") or "").isdigit()
+            )
+            if session_is_live or pid_is_live:
+                target = f"session {wait_session}" if session_is_live else f"pid {wait_pid}"
+                _log(f"kanban goal loop: waiting on {target} without spending a turn")
+                is_waiting = (
+                    (lambda: _session_waiting(wait_session))
+                    if session_is_live
+                    else (lambda: _pid_alive(wait_pid))
+                )
+                while is_waiting():
+                    time.sleep(1.0)
+                    try:
+                        wait_status = task_status_fn()
+                    except Exception as exc:
+                        _log(f"kanban goal loop: status check failed while waiting ({exc}); stopping")
+                        return {
+                            "outcome": "stopped",
+                            "turns_used": turns_used,
+                            "reason": "status check failed",
+                        }
+                    terminal_result = _terminal_wait_result(wait_status)
+                    if terminal_result is not None:
+                        return terminal_result
+                # Close the race between the target's final liveness check and
+                # the continuation turn: board terminal state always wins.
+                try:
+                    released_status = task_status_fn()
+                except Exception as exc:
+                    _log(f"kanban goal loop: status check failed after wait ({exc}); stopping")
+                    return {
+                        "outcome": "stopped",
+                        "turns_used": turns_used,
+                        "reason": "status check failed",
+                    }
+                terminal_result = _terminal_wait_result(released_status)
+                if terminal_result is not None:
+                    return terminal_result
+                # The child exited/triggered (or the task became terminal).
+                # Resume once so the worker can inspect output and finalize.
+                verdict = "continue"
+                reason = f"background {target} finished; inspect its result and finalize"
+            else:
+                _log("kanban goal loop: ignoring WAIT for target absent from live process snapshot")
+                verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "done":

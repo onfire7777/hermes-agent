@@ -15908,7 +15908,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_conversation_with_session_key(agent, session_key: str, **kwargs):
+    """Run one conversation turn with a stable, context-local owner key."""
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    token = set_current_session_key(session_key)
+    try:
+        return agent.run_conversation(**kwargs)
+    finally:
+        reset_current_session_key(token)
+
+
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI",
+    first_response: str,
+    *,
+    session_key: "str | None" = None,
+) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -15923,6 +15939,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return
+    stable_session_key = session_key or cli.session_id
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -15950,9 +15967,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
+        result = _run_conversation_with_session_key(
+            cli.agent,
+            stable_session_key,
             user_message=prompt,
             conversation_history=cli.conversation_history,
+            task_id=stable_session_key,
         )
         # Keep session_id in sync if mid-run compression rotated it.
         if (
@@ -15988,6 +16008,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     _run_loop(
         task_id=task_id,
+        session_key=stable_session_key,
         goal_text=goal_text,
         run_turn=_run_turn,
         task_status_fn=_task_status,
@@ -16407,9 +16428,13 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
+                            _quiet_session_key = cli.session_id
+                            result = _run_conversation_with_session_key(
+                                cli.agent,
+                                _quiet_session_key,
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
+                                task_id=_quiet_session_key,
                             )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
@@ -16448,7 +16473,11 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _run_kanban_goal_loop_q(
+                                    cli,
+                                    response,
+                                    session_key=_quiet_session_key,
+                                )
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

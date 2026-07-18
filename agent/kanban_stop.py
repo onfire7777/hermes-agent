@@ -66,6 +66,33 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def _goal_mode_has_live_background_process() -> bool:
+    """Whether this goal-mode worker has async work that must finish first.
+
+    Only processes owned by the current stable conversation session qualify.
+    Any identity or registry lookup failure keeps the normal fail-closed
+    terminal nudge enabled.
+    """
+    goal_mode = (os.environ.get("HERMES_KANBAN_GOAL_MODE") or "").strip().lower()
+    if goal_mode in {"", "0", "false", "no", "off"}:
+        return False
+    try:
+        from hermes_cli.goals import gather_background_processes
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="")
+        if not session_key:
+            from gateway.session_context import get_session_env
+
+            session_key = get_session_env("HERMES_SESSION_ID", "")
+        return bool(
+            session_key
+            and gather_background_processes(session_key=session_key)
+        )
+    except Exception:
+        return False
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -83,6 +110,8 @@ def build_kanban_stop_nudge(
     if attempts >= max_attempts:
         return None
     if session_called_kanban_terminal(messages):
+        return None
+    if _goal_mode_has_live_background_process():
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"

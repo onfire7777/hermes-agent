@@ -13,7 +13,11 @@ from agent.kanban_stop import (
 
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+    for var in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_STOP_NUDGE",
+        "HERMES_KANBAN_GOAL_MODE",
+    ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -93,6 +97,94 @@ def test_nudge_budget_exhausted(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None
     assert build_kanban_stop_nudge(messages=[], attempts=1, max_attempts=1) is None
     assert build_kanban_stop_nudge(messages=[], attempts=0, max_attempts=1) is not None
+
+
+def test_goal_mode_defers_nudge_while_background_process_is_live(
+    clear_kanban_env, monkeypatch
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "session-a")
+    monkeypatch.setattr(
+        "hermes_cli.goals.gather_background_processes",
+        lambda *, session_key=None, **_kw: (
+            [{"session_id": "proc_ralphex", "status": "running"}]
+            if session_key == "session-a"
+            else []
+        ),
+    )
+
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is None
+
+
+def test_goal_mode_keeps_nudge_when_no_background_process_is_live(
+    clear_kanban_env, monkeypatch
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "session-a")
+    monkeypatch.setattr(
+        "hermes_cli.goals.gather_background_processes",
+        lambda **_kw: [],
+    )
+
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is not None
+
+
+def test_goal_mode_foreign_session_process_does_not_defer_nudge(
+    clear_kanban_env, monkeypatch
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "mine")
+    monkeypatch.setattr(
+        "hermes_cli.goals.gather_background_processes",
+        lambda *, session_key=None, **_kw: [] if session_key == "mine" else [
+            {"session_id": "foreign", "status": "running"}
+        ],
+    )
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is not None
+
+
+def test_goal_mode_exited_same_session_process_does_not_defer_nudge(
+    clear_kanban_env, monkeypatch
+):
+    from tools.process_registry import process_registry
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "mine")
+    monkeypatch.setattr(
+        process_registry,
+        "list_sessions",
+        lambda **_kw: [{"session_id": "finished", "status": "exited"}],
+    )
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is not None
+
+
+def test_non_goal_worker_does_not_defer_for_live_process(
+    clear_kanban_env, monkeypatch
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_plain")
+    gather = pytest.fail
+    monkeypatch.setattr(
+        "hermes_cli.goals.gather_background_processes",
+        lambda **_kw: gather("non-goal worker must not inspect background processes"),
+    )
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is not None
+
+
+def test_goal_mode_registry_error_keeps_fail_closed_nudge(
+    clear_kanban_env, monkeypatch
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_goal")
+    clear_kanban_env.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "mine")
+    monkeypatch.setattr(
+        "hermes_cli.goals.gather_background_processes",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+    assert build_kanban_stop_nudge(messages=[], attempts=0) is not None
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────

@@ -148,6 +148,37 @@ def test_notify_single_query_session_finalize_uses_agent_session(monkeypatch):
     ]
 
 
+def test_run_conversation_with_session_key_binds_and_restores_context():
+    import cli as cli_mod
+    from tools.approval import (
+        get_current_session_key,
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    seen = []
+
+    class _Agent:
+        def run_conversation(self, **kwargs):
+            seen.append((get_current_session_key(default=""), kwargs))
+            return {"final_response": "ok"}
+
+    outer = set_current_session_key("outer-session")
+    try:
+        result = cli_mod._run_conversation_with_session_key(
+            _Agent(),
+            "stable-session",
+            user_message="continue",
+            task_id="stable-session",
+        )
+        assert result["final_response"] == "ok"
+        assert seen[0][0] == "stable-session"
+        assert seen[0][1]["task_id"] == "stable-session"
+        assert get_current_session_key(default="") == "outer-session"
+    finally:
+        reset_current_session_key(outer)
+
+
 def test_human_single_query_main_finalizes_after_query(monkeypatch):
     calls = []
 
@@ -205,8 +236,8 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     import cli as cli_mod
 
-    def run_conversation(*, user_message, conversation_history):
-        calls.append(("run", user_message, conversation_history))
+    def run_conversation(*, user_message, conversation_history, task_id=None):
+        calls.append(("run", user_message, conversation_history, task_id))
         return {
             "final_response": "",
             "error": "provider failed",
@@ -266,5 +297,5 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     assert exc_info.value.code == 1
     assert ("claim", "cli", True) in calls
-    assert ("run", "hello", []) in calls
+    assert ("run", "hello", [], "quiet-session") in calls
     assert calls[-1] == ("finalize", "quiet-session")
