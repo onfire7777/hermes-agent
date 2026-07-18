@@ -68,7 +68,10 @@ def test_cli_health_treats_admission_pause_as_healthy():
 
 
 def test_gateway_health_treats_only_admission_pause_as_healthy():
-    from gateway.kanban_watchers import _dispatcher_tick_is_bad
+    from gateway.kanban_watchers import (
+        _admission_pause_reason_key,
+        _dispatcher_tick_is_bad,
+    )
 
     paused = kb.DispatchResult(adaptive_admission_paused=True)
     assert _dispatcher_tick_is_bad(
@@ -77,6 +80,11 @@ def test_gateway_health_treats_only_admission_pause_as_healthy():
     assert _dispatcher_tick_is_bad(
         [kb.DispatchResult()], ready_pending=True, any_spawned=False
     ) is True
+    assert _admission_pause_reason_key("load1 42.9 > 10.0") == ("load1",)
+    assert _admission_pause_reason_key("load1 37.8 > 10.0") == ("load1",)
+    assert _admission_pause_reason_key(
+        "free memory 29.0% < 35.0%; load1 12.0 > 10.0"
+    ) == ("free_memory", "load1")
 
 
 def test_cli_dispatch_exposes_admission_pause_in_json_and_text(

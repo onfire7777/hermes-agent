@@ -947,7 +947,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        last_admission_pause_reason = None
+        last_admission_pause_key = None
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1274,13 +1274,14 @@ class GatewayKanbanWatchersMixin:
                         )
                         for res in dispatch_results
                     }))
-                    if pause_reason != last_admission_pause_reason:
+                    pause_key = _admission_pause_reason_key(pause_reason)
+                    if pause_key != last_admission_pause_key:
                         logger.info(
                             "kanban dispatcher admission paused: %s", pause_reason
                         )
-                    last_admission_pause_reason = pause_reason
+                    last_admission_pause_key = pause_key
                 else:
-                    last_admission_pause_reason = None
+                    last_admission_pause_key = None
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if _dispatcher_tick_is_bad(
@@ -1330,3 +1331,17 @@ def _dispatcher_tick_is_bad(
         for res in dispatch_results
     )
     return bool(ready_pending and not any_spawned and not admission_paused)
+
+
+def _admission_pause_reason_key(reason: str) -> tuple[str, ...]:
+    """Collapse volatile measurements into stable resource-pressure classes."""
+    classes = set()
+    for segment in reason.split(";"):
+        segment = segment.strip()
+        if segment.startswith("free memory "):
+            classes.add("free_memory")
+        elif segment.startswith("load1 "):
+            classes.add("load1")
+        elif segment:
+            classes.add(segment)
+    return tuple(sorted(classes))
