@@ -2294,6 +2294,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "spawn_failed": res.spawn_failed,
             "auto_assigned_default": res.auto_assigned_default,
             "adaptive_admission_paused": res.adaptive_admission_paused,
             "adaptive_admission_reason": res.adaptive_admission_reason,
@@ -2334,6 +2335,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.spawn_failed:
+        print(f"Spawn failed: {', '.join(res.spawn_failed)}")
     if res.adaptive_admission_paused:
         print(f"Adaptive admission paused: {res.adaptive_admission_reason}")
     return 0
@@ -2341,11 +2344,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 def _dispatcher_tick_is_bad(res, ready_pending: bool) -> bool:
     """Classify only unintentional zero-spawn ticks as unhealthy."""
+    has_unintentional_result = bool(
+        res.skipped_unassigned
+        or res.respawn_guarded
+        or res.spawn_failed
+        or res.auto_blocked
+    )
     intentionally_deferred = (
         res.adaptive_admission_paused
         or (
             bool(res.skipped_per_profile_capped)
-            and not res.skipped_unassigned
+            and not has_unintentional_result
         )
     )
     return bool(

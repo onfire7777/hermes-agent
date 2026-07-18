@@ -1334,7 +1334,12 @@ def _dispatcher_tick_is_bad(
             getattr(res, "adaptive_admission_paused", False)
             or (
                 bool(getattr(res, "skipped_per_profile_capped", ()))
-                and not getattr(res, "skipped_unassigned", ())
+                and not (
+                    getattr(res, "skipped_unassigned", ())
+                    or getattr(res, "respawn_guarded", ())
+                    or getattr(res, "spawn_failed", ())
+                    or getattr(res, "auto_blocked", ())
+                )
             )
         )
         for slug in ready_board_slugs

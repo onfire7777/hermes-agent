@@ -100,6 +100,41 @@ def test_pre_existing_running_counts_against_cap(isolated_kanban_home_with_profi
     assert capped_assignees.count("beta") == 1
 
 
+def test_ready_and_review_tasks_share_profile_cap(
+    isolated_kanban_home_with_profiles,
+):
+    """Ready and review workers consume the same per-profile allowance."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        ready_id = kb.create_task(conn, title="ready", assignee="alpha")
+        review_ids = [
+            kb.create_task(conn, title=f"review {i}", assignee="alpha")
+            for i in range(2)
+        ]
+        with kb.write_txn(conn):
+            conn.executemany(
+                "UPDATE tasks SET status = 'review' WHERE id = ?",
+                [(task_id,) for task_id in review_ids],
+            )
+
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=2,
+        )
+
+    assert [task_id for task_id, _, _ in result.spawned] == [
+        ready_id,
+        review_ids[0],
+    ]
+    assert result.skipped_per_profile_capped == [
+        (review_ids[1], "alpha", 2)
+    ]
+
+
 @pytest.mark.parametrize("cap", [0, -1, "abc", None])
 def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     """Cap values that don't represent a positive int should be treated as
