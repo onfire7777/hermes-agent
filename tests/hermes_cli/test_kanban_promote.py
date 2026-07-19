@@ -166,15 +166,129 @@ def test_promote_blocked_task_works(conn):
 
 
 def _promote_ns(task_id, *, ids=None, reason=None, force=False,
-                dry_run=False, as_json=False):
+                dry_run=False, as_json=False, from_triage=False):
     return argparse.Namespace(
         task_id=task_id,
         reason=list(reason or []),
         ids=list(ids or []) or None,
         force=force,
+        from_triage=from_triage,
         dry_run=dry_run,
         json=as_json,
     )
+
+
+def _triage_task(conn, *, parents_done=True):
+    parent = kb.create_task(conn, title="parent", assignee="setup")
+    task = kb.create_task(
+        conn, title="triaged", parents=[parent], assignee="owner", triage=True
+    )
+    if parents_done:
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    conn.execute(
+        "UPDATE tasks SET block_kind='transient', block_recurrences=3, "
+        "consecutive_failures=4, last_failure_error='kept' WHERE id=?",
+        (task,),
+    )
+    return task, parent
+
+
+def test_triage_promote_requires_explicit_flag(conn):
+    task, _ = _triage_task(conn)
+    ok, err = kb.promote_task(conn, task, actor="tester", reason="audited")
+    assert ok is False and "--from-triage" in err
+    assert kb.get_task(conn, task).status == "triage"
+
+
+def test_triage_promote_requires_nonempty_reason(conn):
+    task, _ = _triage_task(conn)
+    for reason in (None, "", "   "):
+        ok, err = kb.promote_task(
+            conn, task, actor="tester", reason=reason, from_triage=True
+        )
+        assert ok is False and "audit reason" in err
+
+
+def test_triage_promote_rejects_force(conn):
+    task, _ = _triage_task(conn)
+    ok, err = kb.promote_task(
+        conn, task, actor="tester", reason="audited", force=True,
+        from_triage=True,
+    )
+    assert ok is False and "cannot be combined" in err
+
+
+def test_triage_promote_enforces_parent_gate(conn):
+    task, parent = _triage_task(conn, parents_done=False)
+    ok, err = kb.promote_task(
+        conn, task, actor="tester", reason="audited", from_triage=True
+    )
+    assert ok is False and parent in err
+    assert kb.get_task(conn, task).status == "triage"
+
+
+def test_triage_promote_succeeds_without_rewriting_or_erasing_evidence(conn):
+    task, _ = _triage_task(conn)
+    before = kb.get_task(conn, task)
+    ok, err = kb.promote_task(
+        conn, task, actor="tester", reason="operator reviewed recurrence",
+        from_triage=True,
+    )
+    assert ok and err is None
+    after = kb.get_task(conn, task)
+    assert after.status == "ready"
+    assert (after.title, after.body, after.assignee) == (
+        before.title, before.body, before.assignee
+    )
+    assert (after.block_kind, after.block_recurrences,
+            after.consecutive_failures, after.last_failure_error) == (
+        "transient", 3, 4, "kept"
+    )
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='triage_recovered_manual'", (task,)
+    ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload == {
+        "actor": "tester",
+        "reason": "operator reviewed recurrence",
+        "prior_status": "triage",
+        "parent_gate": "satisfied",
+        "block_kind": "transient",
+        "block_recurrences": 3,
+        "consecutive_failures": 4,
+    }
+
+
+def test_triage_promote_dry_run_has_no_mutation_or_event(conn):
+    task, _ = _triage_task(conn)
+    ok, err = kb.promote_task(
+        conn, task, actor="tester", reason="audited", from_triage=True,
+        dry_run=True,
+    )
+    assert ok and err is None
+    assert kb.get_task(conn, task).status == "triage"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? "
+        "AND kind='triage_recovered_manual'", (task,)
+    ).fetchone()["n"] == 0
+
+
+def test_cli_triage_promote_json_and_bulk_mixed_compatibility(kanban_home, capsys):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        triage = kb.create_task(conn, title="triaged", parents=[parent], triage=True)
+        normal = kb.create_task(conn, title="normal", parents=[parent])
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(
+        triage, ids=[normal], reason=["audited"], from_triage=True,
+        as_json=True,
+    ))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert all(item["from_triage"] is True for item in payload)
+    assert all(item["promoted"] is True for item in payload)
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
