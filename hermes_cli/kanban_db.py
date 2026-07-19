@@ -5285,8 +5285,9 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    from_triage: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked`, or explicitly recovered triage task.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -5296,20 +5297,33 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
+    if from_triage and force:
+        return False, "--from-triage cannot be combined with --force"
+    audit_reason = reason.strip() if reason is not None else None
+    if from_triage and not audit_reason:
+        return False, "--from-triage requires a nonempty audit reason"
 
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind, block_recurrences, "
+            "consecutive_failures FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
 
-    if not force:
+        cur_status = row["status"]
+        if cur_status == "triage" and not from_triage:
+            return False, (
+                f"task {task_id} is 'triage'; use --from-triage with an "
+                "audit reason for manual recovery"
+            )
+        allowed = ("todo", "blocked", "triage") if from_triage else ("todo", "blocked")
+        if cur_status not in allowed:
+            return False, (
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                f"{'todo, blocked, or triage' if from_triage else 'todo or blocked'}"
+            )
+
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
@@ -5320,29 +5334,41 @@ def promote_task(
             p["id"] for p in parents
             if p["status"] not in ("done", "archived")
         ]
-        if unsatisfied:
+        if unsatisfied and (from_triage or not force):
             return False, (
                 f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
+                f"{', '.join(unsatisfied)}"
+                + ("" if from_triage else " (use --force to override)")
             )
+        if dry_run:
+            return True, None
 
-    if dry_run:
-        return True, None
-
-    with write_txn(conn):
+        statuses = ("triage",) if cur_status == "triage" else ("todo", "blocked")
+        placeholders = ", ".join("?" for _ in statuses)
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            f"WHERE id = ? AND status IN ({placeholders})",
+            (task_id, *statuses),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(
-            conn,
-            task_id,
-            "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
-        )
+        if cur_status == "triage":
+            _append_event(conn, task_id, "triage_recovered_manual", {
+                "actor": actor,
+                "reason": audit_reason,
+                "prior_status": cur_status,
+                "parent_gate": "satisfied",
+                "block_kind": row["block_kind"],
+                "block_recurrences": row["block_recurrences"],
+                "consecutive_failures": row["consecutive_failures"],
+            })
+        else:
+            _append_event(
+                conn,
+                task_id,
+                "promoted_manual",
+                {"actor": actor, "reason": reason, "forced": force},
+            )
 
     return True, None
 
