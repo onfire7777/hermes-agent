@@ -148,6 +148,33 @@ def test_legacy_initial_blocked_task_without_metadata_is_sticky(
         assert kb.get_task(conn, task_id).status == "blocked"
 
 
+def test_manual_promote_releases_initial_sticky_block(kanban_home: Path) -> None:
+    """Manual promotion is an explicit release, just like unblock."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="operator-released gate",
+            initial_status="blocked",
+        )
+        promoted, error = kb.promote_task(
+            conn,
+            task_id,
+            actor="operator",
+            reason="evidence accepted",
+        )
+        assert promoted and error is None
+
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=1, "
+            "last_failure_error='transient error' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------

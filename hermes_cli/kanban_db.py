@@ -3718,11 +3718,12 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       automatically once the underlying conditions change (e.g. parents
       finish, transient infra error clears).
 
-    The primary signal is the most recent ``"blocked"`` / ``"unblocked"``
-    event.  Explicit unblock wins even though typed block metadata remains for
-    recurrence tracking.  For rows created before blocked-at-creation emitted
-    that event, typed metadata or a ``created`` payload whose original status
-    was ``blocked`` is the backward-compatible sticky signal.
+    The primary signal is the most recent ``"blocked"``, ``"unblocked"``, or
+    ``"promoted_manual"`` event.  Explicit unblock or manual promotion wins
+    even though typed block metadata remains for recurrence tracking.  For
+    rows created before blocked-at-creation emitted that event, typed metadata
+    or a ``created`` payload whose original status was ``blocked`` is the
+    backward-compatible sticky signal.
 
     Returns ``False`` for circuit-breaker blocks, which have no explicit block
     event, no human block kind, and were not originally created blocked.  This
@@ -3730,7 +3731,8 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'unblocked', 'promoted_manual') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
